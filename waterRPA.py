@@ -1068,7 +1068,7 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改V1.0)")
+        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改V1.1)")
         self.resize(900, 850)
         self.engine = RPAEngine()
         
