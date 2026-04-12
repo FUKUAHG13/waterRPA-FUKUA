@@ -3,3 +3,6 @@ pyperclip
 PySide6
 opencv-python
 numpy
+Pillow
+psutil
+pyinstaller
