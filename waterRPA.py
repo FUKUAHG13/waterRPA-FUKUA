@@ -22,7 +22,8 @@ except:
 from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QLabel, QComboBox, QLineEdit, QScrollArea, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame, QCheckBox, QGroupBox, QToolTip,
-                               QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog, QSplitter)
+                               QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog, QSplitter,
+                               QDialog, QDialogButtonBox, QFormLayout)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QSettings, QPoint
 from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion
 import pyperclip
@@ -59,9 +60,6 @@ for i in range(65, 91): VK_MAP[i] = chr(i).lower() # A-Z
 for i in range(48, 58): VK_MAP[i] = chr(i) # 0-9
 for i in range(112, 124): VK_MAP[i] = f'f{i-111}' # F1-F12
 for i in range(0x60, 0x6A): VK_MAP[i] = str(i - 0x60) # 小键盘数字 0-9 映射
-VK_MAP.update({0x6A: '*', 0x6B: '+', 0x6D: '-', 0x6E: '.', 0x6F: '/'}) # 小键盘运算符
-
-# --- 修复：追加所有常用标点符号的底层映射 ---
 VK_MAP.update({
     0xBA: ';', 0xBB: '=', 0xBC: ',', 0xBD: '-', 0xBE: '.', 0xBF: '/', 0xC0: '`',
     0xDB: '[', 0xDC: '\\', 0xDD: ']', 0xDE: '\''
@@ -87,39 +85,28 @@ class KBDLLHOOKSTRUCT(ctypes.Structure):
                 ("time", wintypes.DWORD),
                 ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
 
-# --- 核心修复区：强制声明底层函数的参数与返回值，防止64位指针被截断崩溃 ---
 LRESULT = ctypes.c_ssize_t
 HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p)
 
 user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
 user32.SetWindowsHookExW.restype = ctypes.c_void_p
-
 user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
 user32.UnhookWindowsHookEx.restype = wintypes.BOOL
-
 user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, ctypes.c_void_p]
 user32.CallNextHookEx.restype = LRESULT
-
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = ctypes.c_void_p
-
 user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
 user32.GetMessageW.restype = wintypes.BOOL
-# ---------------------------------------------------------
 
 # ---------------------------------------------------------
 # 全局配置与异步日志系统
 # ---------------------------------------------------------
-GLOBAL_CONFIG = {
-    "log_to_file": False,
-    "log_to_ui": True
-}
+GLOBAL_CONFIG = {"log_to_file": False, "log_to_ui": True}
 
 def get_base_dir():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, 'frozen', False): return os.path.dirname(sys.executable)
+    else: return os.path.dirname(os.path.abspath(__file__))
 
 def get_log_path():
     return os.path.join(get_base_dir(), "rpa_debug_log.txt")
@@ -132,20 +119,16 @@ def log_worker_thread():
             item = LOG_QUEUE.get()
             if item is None: break
             msg, callback = item
-            
             timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             formatted_msg = f"[{timestamp}] {msg}"
-            
             if GLOBAL_CONFIG["log_to_file"]:
                 try:
                     with open(get_log_path(), "a", encoding="utf-8") as f:
                         f.write(formatted_msg + "\n")
                 except: pass
-            
             if callback and GLOBAL_CONFIG["log_to_ui"]:
                 callback(msg)
-        except Exception:
-            pass
+        except: pass
 
 log_thread = threading.Thread(target=log_worker_thread, daemon=True)
 log_thread.start()
@@ -167,7 +150,7 @@ def global_exception_handler(exctype, value, tb):
 sys.excepthook = global_exception_handler
 
 # --------------------------
-# UI组件: 折叠面板与帮助按钮
+# UI组件: 折叠面板与独立配置弹窗
 # --------------------------
 class CollapsibleSection(QWidget):
     def __init__(self, title, parent=None):
@@ -225,6 +208,54 @@ class HelpBtn(QPushButton):
 
     def show_tip(self):
         QToolTip.showText(QCursor.pos(), self.tip_text, self, QRect(), 5000)
+
+class TaskConfigDialog(QDialog):
+    def __init__(self, parent, data):
+        super().__init__(parent)
+        self.setWindowTitle("指令独立识别设置")
+        self.setMinimumSize(350, 250)
+        layout = QVBoxLayout(self)
+        
+        self.enable_chk = QCheckBox("✓ 为当前指令启用独立识别参数")
+        self.enable_chk.setChecked(data.get("custom_en", False))
+        self.enable_chk.setStyleSheet("font-weight: bold; color: #E91E63;")
+        layout.addWidget(self.enable_chk)
+        
+        self.form_widget = QWidget()
+        form = QFormLayout(self.form_widget)
+        form.setContentsMargins(0, 10, 0, 10)
+        
+        self.conf_edit = QLineEdit(str(data.get("custom_conf", "0.8")))
+        self.s_min_edit = QLineEdit(str(data.get("custom_scale_min", "1.0")))
+        self.s_max_edit = QLineEdit(str(data.get("custom_scale_max", "1.0")))
+        self.s_step_edit = QLineEdit(str(data.get("custom_scale_step", "0.05")))
+        self.gray_chk = QCheckBox("灰度匹配 (取消则严格区分颜色)")
+        self.gray_chk.setChecked(data.get("custom_gray", True))
+        
+        form.addRow("目标相似度:", self.conf_edit)
+        form.addRow("最小缩放倍率:", self.s_min_edit)
+        form.addRow("最大缩放倍率:", self.s_max_edit)
+        form.addRow("缩放步长:", self.s_step_edit)
+        form.addRow("色彩模式:", self.gray_chk)
+        
+        layout.addWidget(self.form_widget)
+        self.form_widget.setEnabled(self.enable_chk.isChecked())
+        self.enable_chk.toggled.connect(self.form_widget.setEnabled)
+        
+        btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        layout.addWidget(btn_box)
+
+    def get_data(self):
+        return {
+            "custom_en": self.enable_chk.isChecked(),
+            "custom_conf": self.conf_edit.text(),
+            "custom_scale_min": self.s_min_edit.text(),
+            "custom_scale_max": self.s_max_edit.text(),
+            "custom_scale_step": self.s_step_edit.text(),
+            "custom_gray": self.gray_chk.isChecked()
+        }
 
 # --------------------------
 # 区域选择窗口
@@ -327,7 +358,7 @@ class RegionWindow(QWidget):
                 self.region_selected.emit((real_x, real_y, real_w, real_h))
 
 # --------------------------
-# 全能钩子录制线程 (修复版)
+# 全能钩子录制线程
 # --------------------------
 class HookThread(QThread):
     finished_signal = Signal(list)
@@ -400,14 +431,11 @@ class HookThread(QThread):
             struct = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             if wParam == 0x0100 or wParam == 0x0104: 
                 vk = struct.vkCode
-                if vk != 0x77 and vk != 0x1B: # 强制屏蔽 F8 和 ESC
+                if vk != 0x77 and vk != 0x1B: 
                     if vk in VK_MAP:
                         self.events.append((time.time(), 'key', VK_MAP[vk]))
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
-# --------------------------
-# 悬浮录制控制器UI
-# --------------------------
 class RecorderUI(QWidget):
     def __init__(self, main_window):
         super().__init__()
@@ -433,7 +461,6 @@ class RecorderUI(QWidget):
         
         self.state = 0 
         self.hook_thread = None
-        
         self.f8_pressed = False
         self.esc_pressed = False
         
@@ -455,10 +482,8 @@ class RecorderUI(QWidget):
             
         if curr_f8 and not self.f8_pressed:
             self.f8_pressed = True
-            if self.state == 0:
-                self.start_recording()
-            elif self.state == 1:
-                self.stop_recording()
+            if self.state == 0: self.start_recording()
+            elif self.state == 1: self.stop_recording()
         elif not curr_f8:
             self.f8_pressed = False
 
@@ -493,18 +518,12 @@ class RecorderUI(QWidget):
                     tasks.append({"type": 5.0, "value": f"{delay:.2f}"})
             last_time = t
             
-            if e_type == 'left':
-                tasks.append({"type": 1.0, "value": f"{val[0]},{val[1]}"})
-            elif e_type == 'right':
-                tasks.append({"type": 3.0, "value": f"{val[0]},{val[1]}"})
-            elif e_type == 'left_drag':
-                tasks.append({"type": 10.0, "value": f"{val[0]},{val[1]} -> {val[2]},{val[3]}"})
-            elif e_type == 'right_drag':
-                tasks.append({"type": 11.0, "value": f"{val[0]},{val[1]} -> {val[2]},{val[3]}"})
-            elif e_type == 'scroll':
-                tasks.append({"type": 6.0, "value": str(val)})
-            elif e_type == 'key':
-                tasks.append({"type": 7.0, "value": val})
+            if e_type == 'left': tasks.append({"type": 1.0, "value": f"{val[0]},{val[1]}"})
+            elif e_type == 'right': tasks.append({"type": 3.0, "value": f"{val[0]},{val[1]}"})
+            elif e_type == 'left_drag': tasks.append({"type": 10.0, "value": f"{val[0]},{val[1]} -> {val[2]},{val[3]}"})
+            elif e_type == 'right_drag': tasks.append({"type": 11.0, "value": f"{val[0]},{val[1]} -> {val[2]},{val[3]}"})
+            elif e_type == 'scroll': tasks.append({"type": 6.0, "value": str(val)})
+            elif e_type == 'key': tasks.append({"type": 7.0, "value": val})
                 
         for task in tasks:
             self.main_window.add_row(task)
@@ -517,9 +536,6 @@ class RecorderUI(QWidget):
         self.main_window.showNormal()
         self.close()
 
-# --------------------------
-# 独立看门狗线程
-# --------------------------
 class FailsafeWatchdog(threading.Thread):
     def __init__(self, engine):
         super().__init__()
@@ -557,8 +573,7 @@ class FailsafeWatchdog(threading.Thread):
                                 self.trigger_stop("检测到【任务管理器】前台")
                                 return
                 time.sleep(0.02)
-            except Exception as e:
-                time.sleep(1)
+            except: time.sleep(1)
 
     def trigger_stop(self, reason):
         if not self.engine.stop_requested:
@@ -572,7 +587,7 @@ class FailsafeWatchdog(threading.Thread):
         self.running = False
 
 # --------------------------
-# 核心引擎 (V45+ 内核)
+# 核心引擎
 # --------------------------
 class RPAEngine:
     def __init__(self):
@@ -580,6 +595,8 @@ class RPAEngine:
         self.stop_requested = False
         self.min_scale = 1.0
         self.max_scale = 1.0
+        self.scale_step = 0.05
+        self.enable_grayscale = True
         self.confidence = 0.8
         self.scan_region = None 
         self.dodge_x1 = 100
@@ -588,9 +605,9 @@ class RPAEngine:
         self.dodge_y2 = 100
         self.enable_dodge = False
         self.enable_double_dodge = False
-        self.double_dodge_wait = 0.1
+        self.double_dodge_wait = 0.015
         self.move_duration = 0.0
-        self.click_hold = 0.05
+        self.click_hold = 0.04
         self.settlement_wait = 0.0
         self.timeout_val = 0.0
         self.detect_delay = 0.01
@@ -647,7 +664,6 @@ class RPAEngine:
             write_log("正在预加载资源...")
             for task in tasks:
                 path = str(task.get("value", ""))
-                # 过滤掉坐标格式的输入
                 if not path or not os.path.exists(path) or ',' in path: continue
                 if task.get("type") not in [1.0, 2.0, 3.0, 8.0]: continue
                 
@@ -655,24 +671,46 @@ class RPAEngine:
                 img.load()
                 self.img_cache[path] = img
                 
-                if self.min_scale != 1.0 or self.max_scale != 1.0:
-                    if img.mode != 'L': img = img.convert('L')
-                    template = np.array(img)
-                    templates_list = []
-                    steps = int((self.max_scale - self.min_scale) / 0.05) + 1
-                    for scale in np.linspace(self.min_scale, self.max_scale, steps):
-                        if 0.99 < scale < 1.01: continue
-                        rw = int(template.shape[1] * scale)
-                        rh = int(template.shape[0] * scale)
-                        if rw < 1 or rh < 1: continue
-                        resized_tpl = cv2.resize(template, (rw, rh))
-                        templates_list.append((scale, resized_tpl))
-                    self.scaled_templates_cache[path] = templates_list
+                if task.get("custom_en", False):
+                    try:
+                        s_min = float(task.get("custom_scale_min", self.min_scale))
+                        s_max = float(task.get("custom_scale_max", self.max_scale))
+                        s_step = float(task.get("custom_scale_step", self.scale_step))
+                    except:
+                        s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
+                    use_gray = bool(task.get("custom_gray", self.enable_grayscale))
+                else:
+                    s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
+                    use_gray = self.enable_grayscale
+                    
+                cache_key = f"{path}_{s_min}_{s_max}_{s_step}_{use_gray}"
+                task['cache_key'] = cache_key
+                
+                if s_min != 1.0 or s_max != 1.0:
+                    if cache_key not in self.scaled_templates_cache:
+                        if use_gray:
+                            if img.mode != 'L': img = img.convert('L')
+                            template = np.array(img)
+                        else:
+                            if img.mode != 'RGB': img = img.convert('RGB')
+                            template = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                            
+                        templates_list = []
+                        safe_step = max(s_step, 0.01)
+                        steps = int((s_max - s_min) / safe_step) + 1
+                        for scale in np.linspace(s_min, s_max, steps):
+                            if 0.99 < scale < 1.01: continue
+                            rw = int(template.shape[1] * scale)
+                            rh = int(template.shape[0] * scale)
+                            if rw < 1 or rh < 1: continue
+                            resized_tpl = cv2.resize(template, (rw, rh))
+                            templates_list.append((scale, resized_tpl))
+                        self.scaled_templates_cache[cache_key] = templates_list
             write_log("资源预加载完成。")
         except Exception as e:
             write_log(f"预计算失败: {e}")
 
-    def find_target_optimized(self, img_path):
+    def find_target_optimized(self, img_path, cache_key, task_conf, use_gray):
         try: screenshot_pil = pyautogui.screenshot(region=self.scan_region)
         except: return None
         
@@ -682,12 +720,12 @@ class RPAEngine:
         if not self.opencv_available:
             if img_path in self.img_cache:
                 try: 
-                    res = pyautogui.locate(self.img_cache[img_path], screenshot_pil, confidence=self.confidence)
+                    res = pyautogui.locate(self.img_cache[img_path], screenshot_pil, confidence=task_conf, grayscale=use_gray)
                     if res: return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
                 except: pass
             elif os.path.exists(img_path):
                  try:
-                    res = pyautogui.locate(img_path, screenshot_pil, confidence=self.confidence)
+                    res = pyautogui.locate(img_path, screenshot_pil, confidence=task_conf, grayscale=use_gray)
                     if res: return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
                  except: pass
             return None
@@ -696,7 +734,10 @@ class RPAEngine:
         import numpy as np
         
         screen_np = np.array(screenshot_pil)
-        screen_gray = cv2.cvtColor(screen_np, cv2.COLOR_RGB2GRAY)
+        if use_gray:
+            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2GRAY)
+        else:
+            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
         
         if img_path not in self.img_cache:
             if os.path.exists(img_path):
@@ -709,35 +750,44 @@ class RPAEngine:
         
         pil_template = self.img_cache[img_path]
         try:
-            if pil_template.mode != 'L': pil_template = pil_template.convert('L')
-            tpl_gray = np.array(pil_template)
-            if tpl_gray.shape[0] <= screen_gray.shape[0] and tpl_gray.shape[1] <= screen_gray.shape[1]:
-                res = cv2.matchTemplate(screen_gray, tpl_gray, cv2.TM_CCOEFF_NORMED)
+            if use_gray:
+                if pil_template.mode != 'L': pil_template = pil_template.convert('L')
+                tpl_img = np.array(pil_template)
+            else:
+                if pil_template.mode != 'RGB': pil_template = pil_template.convert('RGB')
+                tpl_img = cv2.cvtColor(np.array(pil_template), cv2.COLOR_RGB2BGR)
+                
+            if tpl_img.shape[0] <= screen_img.shape[0] and tpl_img.shape[1] <= screen_img.shape[1]:
+                res = cv2.matchTemplate(screen_img, tpl_img, cv2.TM_CCOEFF_NORMED)
                 min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
-                if max_v >= self.confidence:
-                    h, w = tpl_gray.shape[:2]
+                if max_v >= task_conf:
+                    h, w = tpl_img.shape[:2]
                     return (max_l[0] + w//2 + offset_x, max_l[1] + h//2 + offset_y, 1.0)
         except: pass
         
-        if img_path in self.scaled_templates_cache:
-            for scale, resized_tpl in self.scaled_templates_cache[img_path]:
+        if cache_key in self.scaled_templates_cache:
+            for scale, resized_tpl in self.scaled_templates_cache[cache_key]:
                 if self.check_stop_flag(): return None
                 try:
-                    if resized_tpl.shape[0] > screen_gray.shape[0] or resized_tpl.shape[1] > screen_gray.shape[1]: continue
-                    res = cv2.matchTemplate(screen_gray, resized_tpl, cv2.TM_CCOEFF_NORMED)
+                    if resized_tpl.shape[0] > screen_img.shape[0] or resized_tpl.shape[1] > screen_img.shape[1]: continue
+                    res = cv2.matchTemplate(screen_img, resized_tpl, cv2.TM_CCOEFF_NORMED)
                     min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
-                    if max_v >= self.confidence:
+                    if max_v >= task_conf:
                         h, w = resized_tpl.shape[:2]
                         return (max_l[0] + w//2 + offset_x, max_l[1] + h//2 + offset_y, scale)
                 except: continue
         return None
 
     def get_cmd_name(self, cmd_val):
-        mapping = {1.0: "左键单击", 2.0: "左键双击", 3.0: "右键单击", 4.0: "输入文本", 5.0: "等待(秒)", 6.0: "滚轮滑动", 7.0: "系统按键", 8.0: "鼠标悬停", 9.0: "截图保存", 10.0: "左键拖拽", 11.0: "右键拖拽"}
+        mapping = {
+            1.0: "左键单击", 2.0: "左键双击", 3.0: "右键单击", 4.0: "输入文本", 
+            5.0: "等待(秒)", 6.0: "滚轮滑动", 7.0: "系统按键", 8.0: "鼠标悬停", 
+            9.0: "截图保存", 10.0: "左键拖拽", 11.0: "右键拖拽", 12.0: "弹窗提醒", 
+            13.0: "停止运行", 14.0: "声音提示"
+        }
         return mapping.get(cmd_val, "未知操作")
 
     def parse_coordinate(self, val):
-        """解析是否为手动输入的坐标格式，如: 960,540"""
         try:
             val_str = str(val).strip()
             if ',' in val_str:
@@ -747,7 +797,7 @@ class RPAEngine:
         except: pass
         return None
 
-    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None):
+    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
         start_time = time.time()
         
@@ -755,7 +805,7 @@ class RPAEngine:
         coord = self.parse_coordinate(img_path)
 
         while True:
-            if self.check_stop_flag(): return
+            if self.check_stop_flag(): return "stopped"
             if self.timeout_val > 0.001 and (time.time() - start_time > self.timeout_val): 
                 if self.log_level >= 1:
                     self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 等待目标超时，已跳过</font>")
@@ -766,7 +816,7 @@ class RPAEngine:
                 find_time = 0.0
             else:
                 find_start = time.time()
-                location_tuple = self.find_target_optimized(img_path)
+                location_tuple = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
                 find_time = time.time() - find_start
 
             if location_tuple:
@@ -796,6 +846,7 @@ class RPAEngine:
                             
                 except Exception as e: 
                     if self.log_level >= 1: self.log(f"<font color='red'>    [错误] 循环#{step_info['loop']} 步{step_info['step']}: {e}</font>")
+                    return "error"
                 return "success"
             else:
                 if reTry != -1:
@@ -818,7 +869,7 @@ class RPAEngine:
             x2, y2 = int(p2[0].strip()), int(p2[1].strip())
         except:
             if self.log_level >= 1: self.log(f"<font color='red'>    [错误] 循环#{step_info['loop']} 步{step_info['step']}: 拖拽坐标格式错误，应为 x1,y1 -> x2,y2</font>")
-            return
+            return "error"
         
         if self.log_level >= 1:
             self.log(f"    -> 正在从 ({x1},{y1}) 拖拽到 ({x2},{y2})")
@@ -829,6 +880,7 @@ class RPAEngine:
         pyautogui.moveTo(x2, y2, duration=max(self.move_duration, 0.3))
         pyautogui.mouseUp(button=button)
         if self.settlement_wait > 0: time.sleep(self.settlement_wait)
+        return "success"
 
     def run_tasks(self, tasks, callback_msg=None):
         self.is_running = True
@@ -860,7 +912,10 @@ class RPAEngine:
                     if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定运行时间，任务正常结束</font>")
                     break
 
-                for idx, task in enumerate(tasks):
+                idx = 0
+                while idx < len(tasks):
+                    task = tasks[idx]
+                    
                     if self.check_stop_flag():
                         if callback_msg: callback_msg("任务由看门狗终止")
                         return
@@ -868,18 +923,45 @@ class RPAEngine:
                     cmd = task.get("type")
                     val = task.get("value")
                     retry = task.get("retry", 1)
+                    fail_skip = int(task.get("fail_skip", 0))
                     
+                    if task.get("custom_en", False):
+                        try: task_conf = float(task.get("custom_conf", self.confidence))
+                        except: task_conf = self.confidence
+                        use_gray = bool(task.get("custom_gray", self.enable_grayscale))
+                    else:
+                        task_conf = self.confidence
+                        use_gray = self.enable_grayscale
+                        
+                    cache_key = task.get('cache_key', f"{val}_{self.min_scale}_{self.max_scale}_{self.scale_step}_{use_gray}")
+
                     cmd_name = self.get_cmd_name(cmd)
                     step_info = {'step': idx + 1, 'loop': loop_count, 'cmd': cmd_name}
                     step_start_time = time.time()
                     
+                    status = "success"
                     try:
-                        status = "success"
-                        if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info)
-                        elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info)
-                        elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info)
-                        elif cmd == 10.0: self.mouseDrag("left", val, step_info)
-                        elif cmd == 11.0: self.mouseDrag("right", val, step_info)
+                        if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray)
+                        elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray)
+                        elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray)
+                        elif cmd == 10.0: status = self.mouseDrag("left", val, step_info)
+                        elif cmd == 11.0: status = self.mouseDrag("right", val, step_info)
+                        elif cmd == 12.0: 
+                            if self.log_level >= 1: self.log(f"    -> 触发弹窗提醒: {val}")
+                            ctypes.windll.user32.MessageBoxW(0, str(val), "脚本强制提醒", 0x00040000 | 0x00010000 | 0x00001000 | 0x00000040)
+                            status = "success"
+                        elif cmd == 13.0: 
+                            if self.log_level >= 1: self.log(f"    -> 触发停止指令，脚本即将终止。备注: {val}")
+                            self.stop()
+                            status = "success"
+                        elif cmd == 14.0: 
+                            if self.log_level >= 0: 
+                                self.log(f"<br><font color='#00BCD4' size='4'><b>🔊 声音提示: {val}</b></font><br>")
+                            try:
+                                import winsound
+                                winsound.MessageBeep(0x00000040) 
+                            except: pass
+                            status = "success"
                         elif cmd == 8.0:
                             coord = self.parse_coordinate(val)
                             if coord:
@@ -887,7 +969,7 @@ class RPAEngine:
                                 find_time = 0.0
                             else:
                                 find_start = time.time()
-                                loc = self.find_target_optimized(val)
+                                loc = self.find_target_optimized(val, cache_key, task_conf, use_gray)
                                 find_time = time.time() - find_start
                                 
                             if loc: 
@@ -936,13 +1018,20 @@ class RPAEngine:
                         color = "gray"
                         if status == "success": status_str = "完成"; color = "gray"
                         elif status == "timeout": status_str = "超时跳过"; color = "orange"
-                        elif status == "not_found": status_str = "未找到目标跳过"; color = "orange"
+                        elif status == "not_found": status_str = "未找目标跳过"; color = "orange"
                         elif status == "error": status_str = "执行异常"; color = "red"
                         
                         self.log(f"<font color='{color}'>循环 #{loop_count} 步 {idx+1} ({cmd_name}) {status_str}，耗时: {step_duration:.2f}s</font>")
 
+                    if status in ["timeout", "not_found", "error"] and fail_skip > 0:
+                        if self.log_level >= 0:
+                            self.log(f"<font color='#9C27B0'><b>    -> [条件分支] 步骤 {idx+1} 执行失败，触发跳过后续 {fail_skip} 步指令！</b></font>")
+                        idx += fail_skip
+
                     if self.detect_delay > 0:
                         time.sleep(self.detect_delay)
+
+                    idx += 1
 
                 if self.check_stop_flag(): return
                 
@@ -978,6 +1067,8 @@ class TaskRow(QFrame):
     def __init__(self, delete_callback):
         super().__init__()
         self.parent_item = None
+        self.custom_data = {}
+        
         self.setFrameShape(QFrame.StyledPanel)
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(2, 2, 2, 2)
@@ -989,12 +1080,15 @@ class TaskRow(QFrame):
         self.layout.addWidget(self.index_label)
         
         self.type_combo = QComboBox()
-        self.type_combo.addItems(["左键单击", "左键双击", "右键单击", "输入文本", "等待(秒)", "滚轮滑动", "系统按键", "鼠标悬停", "截图保存", "左键拖拽", "右键拖拽"])
+        self.type_combo.addItems([
+            "左键单击", "左键双击", "右键单击", "输入文本", "等待(秒)", 
+            "滚轮滑动", "系统按键", "鼠标悬停", "截图保存", "左键拖拽", 
+            "右键拖拽", "弹窗提醒", "停止运行", "声音提示"
+        ])
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         self.layout.addWidget(self.type_combo)
         
         self.value_input = QLineEdit()
-        self.value_input.setPlaceholderText("坐标如: 960,540 或 各种参数")
         self.value_input.textChanged.connect(self.sync_data)
         self.layout.addWidget(self.value_input)
         
@@ -1002,6 +1096,19 @@ class TaskRow(QFrame):
         self.file_btn.setFixedWidth(30)
         self.file_btn.clicked.connect(self.select_file)
         self.layout.addWidget(self.file_btn)
+        
+        self.cfg_btn = QPushButton("⚙️")
+        self.cfg_btn.setFixedWidth(30)
+        self.cfg_btn.setToolTip("独立识别参数设置\n针对此指令单独控制找图的缩放比例与相似度")
+        self.cfg_btn.clicked.connect(self.open_custom_config)
+        self.layout.addWidget(self.cfg_btn)
+        
+        self.skip_input = QLineEdit()
+        self.skip_input.setPlaceholderText("失败跳过(步)")
+        self.skip_input.setFixedWidth(80)
+        self.skip_input.setToolTip("条件分支：如果此步执行失败（如没找到图/超时），则直接跳过后续 N 个指令。\n例如填 2，则失败时自动跳过后面 2 步指令。填 0 为不跳过。")
+        self.skip_input.textChanged.connect(self.sync_data)
+        self.layout.addWidget(self.skip_input)
         
         self.del_btn = QPushButton("X")
         self.del_btn.setStyleSheet("color: red; font-weight: bold;")
@@ -1016,30 +1123,114 @@ class TaskRow(QFrame):
         self.sync_data() 
 
     def sync_data(self):
+        text = self.type_combo.currentText()
+        if "单击" in text or "双击" in text or "悬停" in text:
+            self.cfg_btn.setVisible(True)
+        else:
+            self.cfg_btn.setVisible(False)
+            
         if getattr(self, 'parent_item', None):
             self.parent_item.setData(Qt.UserRole, self.get_data())
 
+    def open_custom_config(self):
+        dialog = TaskConfigDialog(self, self.custom_data)
+        if dialog.exec() == QDialog.Accepted:
+            self.custom_data = dialog.get_data()
+            self.sync_data()
+
     def on_type_changed(self, text):
-        self.file_btn.setVisible("单击" in text or "悬停" in text or "截图" in text)
+        tips = {
+            "左键单击": ("【左键单击】\n识别目标图片并点击其中心，或直接点击指定屏幕坐标。\n参数格式：图片完整路径 或 屏幕坐标，如：100,100", "输入图片路径 或 屏幕坐标，如：960,540"),
+            "左键双击": ("【左键双击】\n识别目标图片并双击其中心，或直接双击指定屏幕坐标。\n参数格式：图片完整路径 或 屏幕坐标，如：100,100", "输入图片路径 或 屏幕坐标，如：960,540"),
+            "右键单击": ("【右键单击】\n识别目标图片并右击其中心，或直接右击指定屏幕坐标。\n参数格式：图片完整路径 或 屏幕坐标，如：100,100", "输入图片路径 或 屏幕坐标，如：960,540"),
+            "输入文本": ("【输入文本】\n模拟键盘自动输入文本内容（支持中文）。\n参数格式：任意想要输入的文字内容", "输入想要发送的文本内容，如：Hello"),
+            "等待(秒)": ("【等待(秒)】\n强行让脚本暂停执行一段时间，受倍速设置影响。\n参数格式：纯数字，如：1.5 或 3", "输入等待的秒数，如：1.5"),
+            "滚轮滑动": ("【滚轮滑动】\n模拟鼠标滚轮上下滚动。\n参数格式：纯数字（正数向上滚，负数向下滚），如：500 或 -500", "输入滚动距离，如：500 或 -500"),
+            "系统按键": ("【系统按键】\n模拟敲击键盘单键或组合快捷键。\n参数格式：单键(如 enter, esc) 或 组合键(如 ctrl+c, alt+tab)", "输入按键组合，如：enter 或 ctrl+v"),
+            "鼠标悬停": ("【鼠标悬停】\n将鼠标移动到指定图片或坐标上方，不进行点击。\n参数格式：图片完整路径 或 屏幕坐标，如：100,100", "输入图片路径 或 屏幕坐标，如：960,540"),
+            "截图保存": ("【截图保存】\n将当前整个屏幕或设定的识别区域截图并保存。\n参数格式：保存的文件夹目录 或 具体的.png文件路径", "输入保存目录，如：D:\\Screenshots"),
+            "左键拖拽": ("【左键拖拽】\n按住鼠标左键，从起点拖动到终点。\n参数格式：起点 -> 终点。例如：100,100 -> 500,500", "输入轨迹坐标，如：100,100 -> 500,500"),
+            "右键拖拽": ("【右键拖拽】\n按住鼠标右键，从起点拖动到终点。\n参数格式：起点 -> 终点。例如：100,100 -> 500,500", "输入轨迹坐标，如：100,100 -> 500,500"),
+            "弹窗提醒": ("【弹窗提醒】\n暂停脚本并弹出一个系统强制定顶提示框，点击确定后继续。\n参数格式：你想提示的文字内容", "输入你想提示的文字，如：任务已完成"),
+            "停止运行": ("【停止运行】\n执行到此步时，直接强行停止整个脚本的运行。\n参数格式：停止时的日志备注（可选）", "输入停止备注，如：条件满足，中止运行"),
+            "声音提示": ("【声音提示】\n播放系统提示音，并在日志中醒目显示备注，不打断操作。\n参数格式：任意内容（作为日志醒目备注）", "输入大号日志备注，如：发现目标！")
+        }
+
+        if text in tips:
+            self.type_combo.setToolTip(tips[text][0])
+            self.value_input.setToolTip(tips[text][0])
+            self.value_input.setPlaceholderText(tips[text][1])
+
+        if "截图" in text:
+            self.file_btn.setVisible(True)
+            self.file_btn.setText("夹")
+            self.file_btn.setToolTip("选择保存截图的文件夹目录")
+        elif "单击" in text or "双击" in text or "悬停" in text:
+            self.file_btn.setVisible(True)
+            self.file_btn.setText("图")
+            self.file_btn.setToolTip("选择本地图片")
+        else:
+            self.file_btn.setVisible(False)
+
+        if "单击" in text or "双击" in text or "拖拽" in text or "悬停" in text:
+            self.skip_input.setVisible(True)
+        else:
+            self.skip_input.setVisible(False)
+            self.skip_input.setText("0")
+            
         self.sync_data()
             
     def set_data(self, data):
         self.value_input.setText(str(data.get("value", "")))
-        TYPES_REV = {1.0: "左键单击", 2.0: "左键双击", 3.0: "右键单击", 4.0: "输入文本", 5.0: "等待(秒)", 6.0: "滚轮滑动", 7.0: "系统按键", 8.0: "鼠标悬停", 9.0: "截图保存", 10.0: "左键拖拽", 11.0: "右键拖拽"}
+        self.skip_input.setText(str(data.get("fail_skip", "0")))
+        
+        self.custom_data = {
+            "custom_en": data.get("custom_en", False),
+            "custom_conf": data.get("custom_conf", "0.8"),
+            "custom_scale_min": data.get("custom_scale_min", "1.0"),
+            "custom_scale_max": data.get("custom_scale_max", "1.0"),
+            "custom_scale_step": data.get("custom_scale_step", "0.05"),
+            "custom_gray": data.get("custom_gray", True)
+        }
+        
+        TYPES_REV = {
+            1.0: "左键单击", 2.0: "左键双击", 3.0: "右键单击", 4.0: "输入文本", 
+            5.0: "等待(秒)", 6.0: "滚轮滑动", 7.0: "系统按键", 8.0: "鼠标悬停", 
+            9.0: "截图保存", 10.0: "左键拖拽", 11.0: "右键拖拽", 12.0: "弹窗提醒", 
+            13.0: "停止运行", 14.0: "声音提示"
+        }
         t = data.get("type", 1.0)
         if t in TYPES_REV:
             self.type_combo.setCurrentText(TYPES_REV[t])
 
     def select_file(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择", filter="Images (*.png *.jpg *.bmp)")
-        if path: self.value_input.setText(path)
+        cmd_type = self.get_data()["type"]
+        if cmd_type == 9.0: 
+            folder = QFileDialog.getExistingDirectory(self, "选择保存文件夹", os.getcwd())
+            if folder: self.value_input.setText(folder)
+        else: 
+            path, _ = QFileDialog.getOpenFileName(self, "选择", filter="Images (*.png *.jpg *.bmp)")
+            if path: self.value_input.setText(path)
 
     def get_data(self):
-        TYPES = {"左键单击": 1.0, "左键双击": 2.0, "右键单击": 3.0, "输入文本": 4.0, "等待(秒)": 5.0, "滚轮滑动": 6.0, "系统按键": 7.0, "鼠标悬停": 8.0, "截图保存": 9.0, "左键拖拽": 10.0, "右键拖拽": 11.0}
+        TYPES = {
+            "左键单击": 1.0, "左键双击": 2.0, "右键单击": 3.0, "输入文本": 4.0, 
+            "等待(秒)": 5.0, "滚轮滑动": 6.0, "系统按键": 7.0, "鼠标悬停": 8.0, 
+            "截图保存": 9.0, "左键拖拽": 10.0, "右键拖拽": 11.0, "弹窗提醒": 12.0, 
+            "停止运行": 13.0, "声音提示": 14.0
+        }
         val = self.value_input.text()
         t = TYPES.get(self.type_combo.currentText(), 1.0)
         if t in [5.0, 6.0] and not val: val = "0"
-        return {"type": t, "value": val}
+        
+        fail_skip = 0
+        skip_text = self.skip_input.text().strip()
+        if skip_text.isdigit():
+            fail_skip = int(skip_text)
+            
+        data_dict = {"type": t, "value": val, "fail_skip": fail_skip}
+        data_dict.update(self.custom_data)
+        return data_dict
 
     def set_index(self, index):
         self.index_label.setText(f"{index}.")
@@ -1068,28 +1259,24 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改V1.1)")
-        self.resize(900, 850)
+        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改v1.2)")
+        self.resize(800, 850)
         self.engine = RPAEngine()
         
-        # 修改：放弃注册表，改用当前目录下的 config.ini 存储所有配置
         self.config_path = os.path.join(get_base_dir(), "config.ini")
         self.settings = QSettings(self.config_path, QSettings.IniFormat)
-        
         self.recorder_ui = None
         
-        # 恢复窗口上次的位置和大小
         geometry = self.settings.value("window_geometry")
         if geometry:
             self.restoreGeometry(geometry)
         
-        # 配置文件体系
         self.profiles_data = {}
         self.current_profile_name = "默认方案"
         self.is_switching_profile = True 
         
-        self.hotkey_start_vk = 0x78 # F9
-        self.hotkey_stop_vk = 0x79  # F10
+        self.hotkey_start_vk = 0x78 
+        self.hotkey_stop_vk = 0x79  
         self.current_process = None
         if HAS_PSUTIL:
             try: self.current_process = psutil.Process()
@@ -1099,7 +1286,7 @@ class RPAWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
         
-        # ================= 顶部方案管理与工具栏 =================
+        # ================= 顶部方案管理与工具栏 (完全恢复老版本经典结构) =================
         profile_layout = QHBoxLayout()
         profile_layout.addWidget(QLabel("<b>配置方案:</b>"))
         self.profile_combo = QComboBox()
@@ -1121,13 +1308,11 @@ class RPAWindow(QMainWindow):
         
         prof_up_btn = QPushButton("↑")
         prof_up_btn.setFixedWidth(25)
-        prof_up_btn.setToolTip("上移方案")
         prof_up_btn.clicked.connect(self.move_profile_up)
         profile_layout.addWidget(prof_up_btn)
         
         prof_down_btn = QPushButton("↓")
         prof_down_btn.setFixedWidth(25)
-        prof_down_btn.setToolTip("下移方案")
         prof_down_btn.clicked.connect(self.move_profile_down)
         profile_layout.addWidget(prof_down_btn)
         
@@ -1139,15 +1324,12 @@ class RPAWindow(QMainWindow):
         load_btn = QPushButton("导入方案")
         load_btn.clicked.connect(self.load)
         profile_layout.addWidget(load_btn)
-        
-        # 新增：打开配置目录按钮
         open_dir_btn = QPushButton("打开配置目录")
         open_dir_btn.clicked.connect(self.open_config_dir)
         profile_layout.addWidget(open_dir_btn)
         
         main_layout.addLayout(profile_layout)
         
-        # 工具栏行
         top_bar = QHBoxLayout()
         add_btn = QPushButton("+ 新增指令")
         add_btn.clicked.connect(lambda: self.add_row())
@@ -1164,23 +1346,29 @@ class RPAWindow(QMainWindow):
         top_bar.addWidget(region_btn)
         
         top_bar.addWidget(HelpBtn("【设定识别区域】\n如CPU占用较高，务必使用此功能！\n框选的搜索范围越小，找图速度越快，对CPU的压力呈指数级减小。"))
-        
         top_bar.addStretch()
         main_layout.addLayout(top_bar)
 
-        # ================= 核心折叠设置区 =================
+        # ================= 核心折叠设置区 (保持70宽度的单行经典排列) =================
         # 1. 识别配置
-        g1 = CollapsibleSection("识别配置")
+        g1 = CollapsibleSection("全局识别配置")
         gl1 = QHBoxLayout()
         gl1.addWidget(QLabel("相似:"))
-        self.conf_edit = QLineEdit("0.8"); self.conf_edit.setFixedWidth(50); gl1.addWidget(self.conf_edit)
-        gl1.addWidget(HelpBtn("【相似度 (0.1 - 1.0)】\n数值越低：越容易匹配，但极易导致乱点误触。\n数值越高：越精确。\n注：修改此数值仅影响精度，不影响CPU占用。"))
-        gl1.addSpacing(20)
+        self.conf_edit = QLineEdit("0.8"); self.conf_edit.setFixedWidth(70); gl1.addWidget(self.conf_edit)
+        gl1.addWidget(HelpBtn("【相似度 (0.1 - 1.0)】\n数值越低：越容易匹配，但极易导致乱点误触。\n数值越高：越精确。"))
+        gl1.addSpacing(15)
         gl1.addWidget(QLabel("缩放:"))
-        self.scale_min = QLineEdit("0.8"); self.scale_min.setFixedWidth(50); gl1.addWidget(self.scale_min)
+        self.scale_min = QLineEdit("0.8"); self.scale_min.setFixedWidth(70); gl1.addWidget(self.scale_min)
         gl1.addWidget(QLabel("-")); 
-        self.scale_max = QLineEdit("1.2"); self.scale_max.setFixedWidth(50); gl1.addWidget(self.scale_max)
-        gl1.addWidget(HelpBtn("【缩放范围】\n程序启动时会预先生成缩放模板缓存。\n建议不要超过 0.5 - 2.0。\n注意：这两个数值相差越大，每次找图需比对的次数越多，对CPU的压力成倍增加！"))
+        self.scale_max = QLineEdit("1.2"); self.scale_max.setFixedWidth(70); gl1.addWidget(self.scale_max)
+        gl1.addWidget(HelpBtn("【缩放范围】\n程序启动时会预先生成缩放模板缓存。建议不要超过 0.8 - 2.0。"))
+        gl1.addSpacing(15)
+        gl1.addWidget(QLabel("步长:")); 
+        self.scale_step = QLineEdit("0.05"); self.scale_step.setFixedWidth(70); gl1.addWidget(self.scale_step)
+        gl1.addWidget(HelpBtn("【缩放步长】\n默认值 0.05，调低会增加CPU压力。"))
+        gl1.addSpacing(15)
+        self.gray_chk = QCheckBox("全局灰度匹配 (极速)"); self.gray_chk.setChecked(True); gl1.addWidget(self.gray_chk)
+        gl1.addWidget(HelpBtn("【灰度匹配】\n开启后极快且省CPU。如果两张图形状一样颜色不同，请关闭！"))
         gl1.addStretch()
         g1.set_content_layout(gl1)
         main_layout.addWidget(g1)
@@ -1189,19 +1377,21 @@ class RPAWindow(QMainWindow):
         g_dodge = CollapsibleSection("避让设置")
         gl_dodge = QHBoxLayout()
         gl_dodge.addWidget(QLabel("坐标1 X:"))
-        self.dodge_x1 = QLineEdit("100"); self.dodge_x1.setFixedWidth(50); gl_dodge.addWidget(self.dodge_x1)
+        self.dodge_x1 = QLineEdit("100"); self.dodge_x1.setFixedWidth(70); gl_dodge.addWidget(self.dodge_x1)
         gl_dodge.addWidget(QLabel("Y:"))
-        self.dodge_y1 = QLineEdit("100"); self.dodge_y1.setFixedWidth(50); gl_dodge.addWidget(self.dodge_y1)
+        self.dodge_y1 = QLineEdit("100"); self.dodge_y1.setFixedWidth(70); gl_dodge.addWidget(self.dodge_y1)
         gl_dodge.addSpacing(15)
         gl_dodge.addWidget(QLabel("坐标2 X:"))
-        self.dodge_x2 = QLineEdit("200"); self.dodge_x2.setFixedWidth(50); gl_dodge.addWidget(self.dodge_x2)
+        self.dodge_x2 = QLineEdit("200"); self.dodge_x2.setFixedWidth(70); gl_dodge.addWidget(self.dodge_x2)
         gl_dodge.addWidget(QLabel("Y:"))
-        self.dodge_y2 = QLineEdit("100"); self.dodge_y2.setFixedWidth(50); gl_dodge.addWidget(self.dodge_y2)
+        self.dodge_y2 = QLineEdit("100"); self.dodge_y2.setFixedWidth(70); gl_dodge.addWidget(self.dodge_y2)
+        gl_dodge.addSpacing(15)
         self.dodge_chk = QCheckBox("启用"); gl_dodge.addWidget(self.dodge_chk)
         self.double_dodge_chk = QCheckBox("二段"); gl_dodge.addWidget(self.double_dodge_chk)
+        gl_dodge.addSpacing(15)
         gl_dodge.addWidget(QLabel("间隔:"))
-        self.dbl_wait = QLineEdit("0.1"); self.dbl_wait.setFixedWidth(60); gl_dodge.addWidget(self.dbl_wait)
-        gl_dodge.addWidget(HelpBtn("【二段避让间隔】\n第一次避让与第二次避让之间的间隔时间，单位：秒\n部分游戏需要短暂间隔才能识别鼠标移动"))
+        self.dbl_wait = QLineEdit("0.015"); self.dbl_wait.setFixedWidth(70); gl_dodge.addWidget(self.dbl_wait)
+        gl_dodge.addWidget(HelpBtn("【二段避让间隔】\n间隔时间，单位：秒"))
         gl_dodge.addStretch()
         g_dodge.set_content_layout(gl_dodge)
         main_layout.addWidget(g_dodge)
@@ -1209,18 +1399,23 @@ class RPAWindow(QMainWindow):
         # 3. 速度控制
         g2 = CollapsibleSection("速度控制 (0为极速)")
         gl2 = QHBoxLayout()
-        gl2.addWidget(QLabel("移动(s):")); self.move_spd = QLineEdit("0.0"); self.move_spd.setFixedWidth(50); gl2.addWidget(self.move_spd)
-        gl2.addWidget(HelpBtn("【移动耗时】\n0.0=瞬移"))
-        gl2.addWidget(QLabel("按住(s):")); self.click_hld = QLineEdit("0.05"); self.click_hld.setFixedWidth(50); gl2.addWidget(self.click_hld)
-        gl2.addWidget(HelpBtn("【按住时长】\n建议0.04-0.08模拟真人点击"))
-        gl2.addWidget(QLabel("缓冲(s):")); self.settle = QLineEdit("0"); self.settle.setFixedWidth(50); gl2.addWidget(self.settle)
-        gl2.addWidget(HelpBtn("【结算缓冲】\n点击后的等待时间"))
-        gl2.addWidget(QLabel("超时(s):")); self.timeout = QLineEdit("0.0"); self.timeout.setFixedWidth(50); gl2.addWidget(self.timeout)
-        gl2.addWidget(HelpBtn("【单步超时】\n0.0=扫一眼没找到直接过"))
-        gl2.addWidget(QLabel("频率(s):")); self.detect_delay = QLineEdit("0.01"); self.detect_delay.setFixedWidth(60); gl2.addWidget(self.detect_delay)
-        gl2.addWidget(HelpBtn("【检测频率(找图间隔)】\n没找到图时的等待时间(秒)\n默认极速为0.01，若CPU占用过高，建议设置为 0.1 - 0.5"))
-        gl2.addWidget(QLabel("倍速:")); self.playback_speed = QLineEdit("1.0"); self.playback_speed.setFixedWidth(40); gl2.addWidget(self.playback_speed)
-        gl2.addWidget(HelpBtn("【倍速执行】\n用于缩短录制时长产生的等待时间（仅影响'等待(秒)'指令）。\n> 1.0 为加速，< 1.0 为减速。\n注意：如果执行出现BUG请调低数值！"))
+        gl2.addWidget(QLabel("移动(s):")); self.move_spd = QLineEdit("0.0"); self.move_spd.setFixedWidth(70); gl2.addWidget(self.move_spd)
+        gl2.addWidget(HelpBtn("【移动耗时】 0.0=瞬移"))
+        gl2.addSpacing(15)
+        gl2.addWidget(QLabel("按住(s):")); self.click_hld = QLineEdit("0.04"); self.click_hld.setFixedWidth(70); gl2.addWidget(self.click_hld)
+        gl2.addWidget(HelpBtn("【按住时长】 建议0.04-0.08模拟真人点击"))
+        gl2.addSpacing(15)
+        gl2.addWidget(QLabel("缓冲(s):")); self.settle = QLineEdit("0.0"); self.settle.setFixedWidth(70); gl2.addWidget(self.settle)
+        gl2.addWidget(HelpBtn("【结算缓冲】 点击后的等待时间"))
+        gl2.addSpacing(15)
+        gl2.addWidget(QLabel("超时(s):")); self.timeout = QLineEdit("0.0"); self.timeout.setFixedWidth(70); gl2.addWidget(self.timeout)
+        gl2.addWidget(HelpBtn("【单步超时】 0.0=扫一眼没找到直接过"))
+        gl2.addSpacing(15)
+        gl2.addWidget(QLabel("频率(s):")); self.detect_delay = QLineEdit("0.01"); self.detect_delay.setFixedWidth(70); gl2.addWidget(self.detect_delay)
+        gl2.addWidget(HelpBtn("【找图频率】 没找到图时的等待时间。默认 0.01"))
+        gl2.addSpacing(15)
+        gl2.addWidget(QLabel("倍速:")); self.playback_speed = QLineEdit("1.0"); self.playback_speed.setFixedWidth(70); gl2.addWidget(self.playback_speed)
+        gl2.addWidget(HelpBtn("【倍速执行】 用于缩放录制的等待指令时间，> 1 为加速"))
         gl2.addStretch()
         g2.set_content_layout(gl2)
         main_layout.addWidget(g2)
@@ -1232,20 +1427,20 @@ class RPAWindow(QMainWindow):
         gl3_r1 = QHBoxLayout()
         gl3_r1.addWidget(QLabel("启动热键:"))
         self.hotkey_start_combo = QComboBox(); self.hotkey_start_combo.addItems([f"F{i}" for i in range(1, 13)])
-        self.hotkey_start_combo.setCurrentText("F9"); self.hotkey_start_combo.setFixedWidth(75)
+        self.hotkey_start_combo.setCurrentText("F9"); self.hotkey_start_combo.setFixedWidth(100)
         self.hotkey_start_combo.currentTextChanged.connect(self.update_hotkeys)
         gl3_r1.addWidget(self.hotkey_start_combo)
         
         gl3_r1.addWidget(QLabel("停止热键:"))
         self.hotkey_stop_combo = QComboBox(); self.hotkey_stop_combo.addItems([f"F{i}" for i in range(1, 13)])
-        self.hotkey_stop_combo.setCurrentText("F10"); self.hotkey_stop_combo.setFixedWidth(75)
+        self.hotkey_stop_combo.setCurrentText("F10"); self.hotkey_stop_combo.setFixedWidth(100)
         self.hotkey_stop_combo.currentTextChanged.connect(self.update_hotkeys)
         gl3_r1.addWidget(self.hotkey_stop_combo)
         
         gl3_r1.addSpacing(15)
         gl3_r1.addWidget(QLabel("日志级别:"))
         self.log_level_combo = QComboBox(); self.log_level_combo.addItems(["简易", "详细", "完全"])
-        self.log_level_combo.setFixedWidth(80)
+        self.log_level_combo.setFixedWidth(100)
         gl3_r1.addWidget(self.log_level_combo)
         gl3_r1.addStretch()
         
@@ -1253,12 +1448,9 @@ class RPAWindow(QMainWindow):
         self.tm_failsafe = QCheckBox("任务管理器急停"); self.tm_failsafe.setChecked(True); gl3_r2.addWidget(self.tm_failsafe)
         self.tr_failsafe = QCheckBox("右上角急停"); self.tr_failsafe.setChecked(True); gl3_r2.addWidget(self.tr_failsafe)
         self.key_failsafe = QCheckBox("ESC/中键急停"); self.key_failsafe.setChecked(True); gl3_r2.addWidget(self.key_failsafe)
-        
         gl3_r2.addSpacing(15)
         self.log_file_chk = QCheckBox("写入文件日志"); gl3_r2.addWidget(self.log_file_chk)
         self.log_ui_chk = QCheckBox("界面日志"); self.log_ui_chk.setChecked(True); gl3_r2.addWidget(self.log_ui_chk)
-        self.log_file_chk.stateChanged.connect(self.update_log_config)
-        self.log_ui_chk.stateChanged.connect(self.update_log_config)
         gl3_r2.addStretch()
         
         gl3_main.addLayout(gl3_r1)
@@ -1276,7 +1468,7 @@ class RPAWindow(QMainWindow):
         bottom_vbox = QVBoxLayout(bottom_widget)
         bottom_vbox.setContentsMargins(0, 0, 0, 0)
         
-        # 底部控制区
+        # 底部控制区 (Start/Stop 回到这里)
         bot_layout = QHBoxLayout()
         self.loop_combo = QComboBox()
         self.loop_combo.addItems(["单次", "无限", "指定次数", "指定时间(时)", "指定时间(分)", "指定时间(秒)"])
@@ -1289,7 +1481,7 @@ class RPAWindow(QMainWindow):
         
         bot_layout.addSpacing(20)
         self.mini_chk = QCheckBox("最小化"); bot_layout.addWidget(self.mini_chk)
-        self.top_chk = QCheckBox("置顶"); self.top_chk.stateChanged.connect(self.toggle_top_window)
+        self.top_chk = QCheckBox("窗口置顶"); self.top_chk.stateChanged.connect(self.toggle_top_window)
         bot_layout.addWidget(self.top_chk)
         bot_layout.addStretch()
         
@@ -1341,26 +1533,17 @@ class RPAWindow(QMainWindow):
         self.bind_setting_logs()
 
     def open_config_dir(self):
-        """打开配置文件所在的本地目录"""
-        try:
-            os.startfile(get_base_dir())
-        except Exception as e:
-            QMessageBox.warning(self, "错误", f"无法打开配置目录: {e}")
+        try: os.startfile(get_base_dir())
+        except Exception as e: QMessageBox.warning(self, "错误", f"无法打开配置目录: {e}")
 
     def append_log(self, msg):
-        """智能日志追加：若用户在看历史记录，则不自动滚动到底部；若在底部，则自动跟随。"""
         scrollbar = self.log_text.verticalScrollBar()
         is_at_bottom = scrollbar.value() >= scrollbar.maximum() - 5
         old_val = scrollbar.value()
-        
         self.log_text.append(msg)
-        
-        if not is_at_bottom:
-            scrollbar.setValue(old_val)
-        else:
-            scrollbar.setValue(scrollbar.maximum())
+        if not is_at_bottom: scrollbar.setValue(old_val)
+        else: scrollbar.setValue(scrollbar.maximum())
 
-    # ================= 方案管理核心逻辑 =================
     def init_profiles(self):
         saved_profiles = self.settings.value("profiles_json", "{}")
         try: self.profiles_data = json.loads(saved_profiles)
@@ -1377,17 +1560,15 @@ class RPAWindow(QMainWindow):
             self.profile_combo.setCurrentIndex(0)
             
         self.is_switching_profile = False
-        # 修复Bug：切断重新打开被前一个界面状态覆盖的源头
         self.current_profile_name = self.profile_combo.currentText()
         self.apply_ui_config(self.profiles_data[self.current_profile_name])
-        self.toggle_top_window()
 
     def get_default_config_dict(self):
         return {
-            "conf": "0.8", "scale_min": "0.8", "scale_max": "1.2",
+            "conf": "0.8", "scale_min": "0.8", "scale_max": "1.2", "scale_step": "0.05", "gray_en": True,
             "dodge_x1": "100", "dodge_y1": "100", "dodge_x2": "200", "dodge_y2": "100",
-            "dodge_en": False, "dbl_dodge": False, "dbl_wait": "0.1",
-            "move_spd": "0.0", "click_hld": "0.05", "settle": "0", "timeout": "0.0", "detect_delay": "0.01", "playback_speed": "1.0",
+            "dodge_en": False, "dbl_dodge": False, "dbl_wait": "0.015",
+            "move_spd": "0.0", "click_hld": "0.04", "settle": "0.0", "timeout": "0.0", "detect_delay": "0.01", "playback_speed": "1.0",
             "hotkey_start": "F9", "hotkey_stop": "F10", "log_level": 0,
             "tm_fs": True, "tr_fs": True, "key_fs": True,
             "log_f": False, "log_ui": True, "mini": False, "top": False,
@@ -1404,7 +1585,7 @@ class RPAWindow(QMainWindow):
             else: tasks.append(item.data(Qt.UserRole))
             
         return {
-            "conf": self.conf_edit.text(), "scale_min": self.scale_min.text(), "scale_max": self.scale_max.text(),
+            "conf": self.conf_edit.text(), "scale_min": self.scale_min.text(), "scale_max": self.scale_max.text(), "scale_step": self.scale_step.text(), "gray_en": self.gray_chk.isChecked(),
             "dodge_x1": self.dodge_x1.text(), "dodge_y1": self.dodge_y1.text(), "dodge_x2": self.dodge_x2.text(), "dodge_y2": self.dodge_y2.text(),
             "dodge_en": self.dodge_chk.isChecked(), "dbl_dodge": self.double_dodge_chk.isChecked(), "dbl_wait": self.dbl_wait.text(),
             "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "detect_delay": self.detect_delay.text(), "playback_speed": self.playback_speed.text(),
@@ -1420,19 +1601,21 @@ class RPAWindow(QMainWindow):
             self.conf_edit.setText(str(cfg.get("conf", "0.8")))
             self.scale_min.setText(str(cfg.get("scale_min", "0.8")))
             self.scale_max.setText(str(cfg.get("scale_max", "1.2")))
+            self.scale_step.setText(str(cfg.get("scale_step", "0.05")))
+            self.gray_chk.setChecked(bool(cfg.get("gray_en", True)))
             self.dodge_x1.setText(str(cfg.get("dodge_x1", "100")))
             self.dodge_y1.setText(str(cfg.get("dodge_y1", "100")))
             self.dodge_x2.setText(str(cfg.get("dodge_x2", "200")))
             self.dodge_y2.setText(str(cfg.get("dodge_y2", "100")))
             self.dodge_chk.setChecked(bool(cfg.get("dodge_en", False)))
             self.double_dodge_chk.setChecked(bool(cfg.get("dbl_dodge", False)))
-            self.dbl_wait.setText(str(cfg.get("dbl_wait", "0.1")))
+            self.dbl_wait.setText(str(cfg.get("dbl_wait", "0.015")))
             
             self.move_spd.setText(str(cfg.get("move_spd", "0.0")))
-            self.click_hld.setText(str(cfg.get("click_hld", "0.05")))
-            self.settle.setText(str(cfg.get("settle", "0")))
+            self.click_hld.setText(str(cfg.get("click_hld", "0.04")))
+            self.settle.setText(str(cfg.get("settle", "0.0")))
             self.timeout.setText(str(cfg.get("timeout", "0.0")))
-            self.detect_delay.setText(str(cfg.get("detect_delay", "0.001")))
+            self.detect_delay.setText(str(cfg.get("detect_delay", "0.01")))
             self.playback_speed.setText(str(cfg.get("playback_speed", "1.0")))
             
             self.hotkey_start_combo.setCurrentText(str(cfg.get("hotkey_start", "F9")))
@@ -1479,10 +1662,8 @@ class RPAWindow(QMainWindow):
             if text in self.profiles_data:
                 QMessageBox.warning(self, "错误", "方案名称已存在！")
                 return
-            
             self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
             self.profiles_data[text] = self.get_default_config_dict()
-            
             self.is_switching_profile = True
             self.profile_combo.addItem(text)
             self.profile_combo.setCurrentText(text)
@@ -1497,18 +1678,12 @@ class RPAWindow(QMainWindow):
             if text in self.profiles_data:
                 QMessageBox.warning(self, "错误", "方案名称已存在！")
                 return
-            
-            # 修复：安全剥离旧名字下的数据
             self.profiles_data[text] = self.profiles_data.pop(old_name, self.get_current_ui_config())
-            
             self.is_switching_profile = True
             idx = self.profile_combo.findText(old_name)
-            if idx >= 0:
-                self.profile_combo.setItemText(idx, text)
+            if idx >= 0: self.profile_combo.setItemText(idx, text)
             self.current_profile_name = text
             self.is_switching_profile = False
-            
-            self.settings.setValue("current_profile", self.current_profile_name)
             if GLOBAL_CONFIG["log_to_ui"]:
                 self.append_log(f"<font color='#FF9800'><b>>>> 方案已重命名: {old_name} -> {text}</b></font>")
 
@@ -1517,19 +1692,15 @@ class RPAWindow(QMainWindow):
             QMessageBox.warning(self, "错误", "至少需要保留一个方案！")
             return
         del_name = self.current_profile_name
-        
         self.profiles_data.pop(del_name, None)
         
         self.is_switching_profile = True
         idx = self.profile_combo.findText(del_name)
-        if idx >= 0:
-            self.profile_combo.removeItem(idx)
+        if idx >= 0: self.profile_combo.removeItem(idx)
             
         self.current_profile_name = self.profile_combo.currentText()
-        
         if self.current_profile_name not in self.profiles_data:
-            if self.profiles_data:
-                self.current_profile_name = list(self.profiles_data.keys())[0]
+            if self.profiles_data: self.current_profile_name = list(self.profiles_data.keys())[0]
             else:
                 self.profiles_data["默认方案"] = self.get_default_config_dict()
                 self.current_profile_name = "默认方案"
@@ -1544,14 +1715,12 @@ class RPAWindow(QMainWindow):
             keys = list(self.profiles_data.keys())
             keys[idx - 1], keys[idx] = keys[idx], keys[idx - 1]
             self.profiles_data = {k: self.profiles_data[k] for k in keys}
-            
             self.is_switching_profile = True
             self.profile_combo.clear()
             self.profile_combo.addItems(keys)
             self.profile_combo.setCurrentIndex(idx - 1)
             self.current_profile_name = self.profile_combo.currentText()
             self.is_switching_profile = False
-            self.settings.setValue("profiles_json", json.dumps(self.profiles_data))
 
     def move_profile_down(self):
         idx = self.profile_combo.currentIndex()
@@ -1559,25 +1728,22 @@ class RPAWindow(QMainWindow):
         if idx < len(keys) - 1:
             keys[idx + 1], keys[idx] = keys[idx], keys[idx + 1]
             self.profiles_data = {k: self.profiles_data[k] for k in keys}
-            
             self.is_switching_profile = True
             self.profile_combo.clear()
             self.profile_combo.addItems(keys)
             self.profile_combo.setCurrentIndex(idx + 1)
             self.current_profile_name = self.profile_combo.currentText()
             self.is_switching_profile = False
-            self.settings.setValue("profiles_json", json.dumps(self.profiles_data))
 
-    # ================= 操作录制逻辑 =================
     def start_recording(self):
         self.showMinimized()
         self.recorder_ui = RecorderUI(self)
 
-    # ================= UI基础交互 =================
     def bind_setting_logs(self):
         self.conf_edit.editingFinished.connect(lambda: self.log_setting_change("相似度", self.conf_edit.text()))
         self.scale_min.editingFinished.connect(lambda: self.log_setting_change("最小缩放", self.scale_min.text()))
         self.scale_max.editingFinished.connect(lambda: self.log_setting_change("最大缩放", self.scale_max.text()))
+        self.scale_step.editingFinished.connect(lambda: self.log_setting_change("缩放步长", self.scale_step.text()))
         self.dodge_x1.editingFinished.connect(lambda: self.log_setting_change("避让坐标1 X", self.dodge_x1.text()))
         self.dodge_y1.editingFinished.connect(lambda: self.log_setting_change("避让坐标1 Y", self.dodge_y1.text()))
         self.dodge_x2.editingFinished.connect(lambda: self.log_setting_change("避让坐标2 X", self.dodge_x2.text()))
@@ -1591,6 +1757,7 @@ class RPAWindow(QMainWindow):
         self.playback_speed.editingFinished.connect(lambda: self.log_setting_change("倍速执行", self.playback_speed.text()))
         self.loop_val_edit.editingFinished.connect(lambda: self.log_setting_change("循环参数", self.loop_val_edit.text()))
 
+        self.gray_chk.stateChanged.connect(lambda s: self.log_setting_change("灰度匹配", "开启" if s else "关闭"))
         self.dodge_chk.stateChanged.connect(lambda s: self.log_setting_change("启用避让", "开启" if s else "关闭"))
         self.double_dodge_chk.stateChanged.connect(lambda s: self.log_setting_change("二段避让", "开启" if s else "关闭"))
         self.tm_failsafe.stateChanged.connect(lambda s: self.log_setting_change("任务管理器急停", "开启" if s else "关闭"))
@@ -1599,8 +1766,7 @@ class RPAWindow(QMainWindow):
         self.log_file_chk.stateChanged.connect(lambda s: self.log_setting_change("写入文件日志", "开启" if s else "关闭"))
         self.log_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("显示界面日志", "开启" if s else "关闭"))
         self.mini_chk.stateChanged.connect(lambda s: self.log_setting_change("启动时最小化", "开启" if s else "关闭"))
-        self.top_chk.stateChanged.connect(lambda s: self.log_setting_change("窗口置顶", "开启" if s else "关闭"))
-
+        
         self.hotkey_start_combo.currentTextChanged.connect(lambda t: self.log_setting_change("启动热键", t))
         self.hotkey_stop_combo.currentTextChanged.connect(lambda t: self.log_setting_change("停止热键", t))
         self.log_level_combo.currentTextChanged.connect(lambda t: self.log_setting_change("日志级别", t))
@@ -1620,18 +1786,30 @@ class RPAWindow(QMainWindow):
         try:
             start_txt = self.hotkey_start_combo.currentText()
             stop_txt = self.hotkey_stop_combo.currentText()
-            
             self.hotkey_start_vk = 0x70 + (int(start_txt.replace("F", "")) - 1)
             self.hotkey_stop_vk = 0x70 + (int(stop_txt.replace("F", "")) - 1)
-            
             self.start_btn.setText(f"启动 ({start_txt})")
             self.stop_btn.setText(f"停止 ({stop_txt})")
         except: pass
 
     def toggle_top_window(self):
-        if self.top_chk.isChecked(): self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
-        else: self.setWindowFlags(self.windowFlags() & ~Qt.WindowStaysOnTopHint)
-        self.show()
+        """修复：安全修改窗口标志，避免破坏原生句柄导致X号点不了"""
+        flags = self.windowFlags()
+        should_be_top = self.top_chk.isChecked()
+        is_top = bool(flags & Qt.WindowStaysOnTopHint)
+        
+        if is_top == should_be_top: 
+            return
+            
+        if should_be_top:
+            flags |= Qt.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowStaysOnTopHint
+            
+        self.setWindowFlags(flags)
+        # 必须确保只有在窗口真正可见时才调用 show()，防止 __init__ 期间触发严重BUG
+        if self.isVisible():
+            self.show()
 
     def check_hotkey(self):
         start_pressed = GetAsyncKeyState(self.hotkey_start_vk) & 0x8000
@@ -1659,12 +1837,21 @@ class RPAWindow(QMainWindow):
         self.append_log(f"已锁定游戏区域(物理): {rect_tuple} (速度+++)")
 
     def closeEvent(self, event):
-        self.settings.setValue("window_geometry", self.saveGeometry())
-        
-        self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
-        self.settings.setValue("profiles_json", json.dumps(self.profiles_data))
-        self.settings.setValue("current_profile", self.current_profile_name)
-        event.accept()
+        """终极修复：强力异常捕获+强制放行，确保不管什么情况点X号都能瞬间关掉软件"""
+        try:
+            self.settings.setValue("window_geometry", self.saveGeometry())
+            self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
+            self.settings.setValue("profiles_json", json.dumps(self.profiles_data))
+            self.settings.setValue("current_profile", self.current_profile_name)
+            
+            if getattr(self, 'worker', None) and self.worker.isRunning():
+                self.engine.stop()
+                self.worker.quit()
+                self.worker.wait(1000)
+        except Exception as e:
+            write_log(f"退出前保存异常: {e}")
+        finally:
+            event.accept()
 
     def update_log_config(self):
         GLOBAL_CONFIG["log_to_file"] = self.log_file_chk.isChecked()
@@ -1745,7 +1932,6 @@ class RPAWindow(QMainWindow):
                     raise ValueError("无法识别的配置文件格式")
 
                 self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
-
                 self.profiles_data[new_name] = new_profile_data
                 
                 self.is_switching_profile = True
@@ -1761,12 +1947,15 @@ class RPAWindow(QMainWindow):
                 QMessageBox.warning(self, "导入失败", str(e))
 
     def validate_tasks(self, tasks):
-        """核心修复：引擎执行前全栈语法校验，防止瞎填参数导致异常"""
         for i, task in enumerate(tasks):
             t = task.get("type")
             v = str(task.get("value", "")).strip()
+            fail_skip = str(task.get("fail_skip", "0")).strip()
             
-            if not v and t not in [9.0]: 
+            if fail_skip and not fail_skip.isdigit():
+                return f"第 {i+1} 步的'失败跳过'必须是整数！\n填入内容: {fail_skip}"
+            
+            if not v and t not in [9.0, 12.0, 13.0, 14.0]: 
                 return f"第 {i+1} 步参数不能为空！"
             
             if t in [1.0, 2.0, 3.0, 8.0]: 
@@ -1784,13 +1973,11 @@ class RPAWindow(QMainWindow):
                 except: return f"第 {i+1} 步参数必须是纯数字！"
         return None
 
-    # ================= 引擎调度 =================
     def start_task(self):
         cfg = self.get_current_ui_config()
         tasks = cfg.get("tasks", [])
         if not tasks: return
         
-        # 启动前执行强语法校验装甲
         err_msg = self.validate_tasks(tasks)
         if err_msg:
             QMessageBox.critical(self, "指令语法错误", err_msg)
@@ -1799,6 +1986,8 @@ class RPAWindow(QMainWindow):
         try:
             self.engine.min_scale = float(cfg["scale_min"])
             self.engine.max_scale = float(cfg["scale_max"])
+            self.engine.scale_step = float(cfg.get("scale_step", "0.05"))
+            self.engine.enable_grayscale = bool(cfg.get("gray_en", True))
             self.engine.dodge_x1 = int(cfg["dodge_x1"])
             self.engine.dodge_y1 = int(cfg["dodge_y1"])
             self.engine.dodge_x2 = int(cfg["dodge_x2"])
