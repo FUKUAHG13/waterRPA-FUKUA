@@ -32,6 +32,8 @@ import pyperclip
 from PIL import Image
 import pyautogui
 
+SLIM_BUILD = True
+
 try:
     import psutil
     HAS_PSUTIL = True
@@ -240,14 +242,14 @@ class TaskConfigDialog(QDialog):
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowFlag(Qt.Window, True)
         self.setWindowModality(Qt.NonModal)
-        self.image_settings_available = image_settings_available
+        self.image_settings_available = image_settings_available and not SLIM_BUILD
         self.point_limit_available = point_limit_available
         self.dialog_settings = QSettings(os.path.join(get_base_dir(), "config.ini"), QSettings.IniFormat)
         self.setWindowTitle("步骤设置")
         self.setMinimumSize(560, 560)
         layout = QVBoxLayout(self)
         
-        note = QLabel("图片识别设置仅对图片点击/图片悬停生效；直接输入坐标时会自动忽略这些参数。")
+        note = QLabel("精简版仅支持原图原尺寸精确识别；已去掉相似度、缩放和灰度识别。")
         note.setStyleSheet("color: #666;")
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -256,6 +258,8 @@ class TaskConfigDialog(QDialog):
         self.enable_chk.setChecked(data.get("custom_en", False))
         self.enable_chk.setStyleSheet("font-weight: bold; color: #E91E63;")
         layout.addWidget(self.enable_chk)
+        if SLIM_BUILD:
+            self.enable_chk.hide()
         
         self.form_widget = QWidget()
         form = QFormLayout(self.form_widget)
@@ -275,12 +279,14 @@ class TaskConfigDialog(QDialog):
         form.addRow("色彩模式:", self.gray_chk)
         
         layout.addWidget(self.form_widget)
+        if SLIM_BUILD:
+            self.form_widget.hide()
         self.enable_chk.setEnabled(self.image_settings_available)
         self.form_widget.setEnabled(self.image_settings_available and self.enable_chk.isChecked())
         self.enable_chk.toggled.connect(self.update_image_settings_enabled)
 
         if not self.image_settings_available:
-            disabled_note = QLabel("当前步骤不是图片识别模式，以上图片识别参数不会参与执行。")
+            disabled_note = QLabel("精简版已移除独立识别参数；图片步骤会按原图原尺寸精确匹配。")
             disabled_note.setStyleSheet("color: #999;")
             disabled_note.setWordWrap(True)
             layout.addWidget(disabled_note)
@@ -1043,16 +1049,8 @@ class RPAEngine:
         except: pass
 
     def check_engine_status(self):
-        try:
-            import cv2
-            import numpy
-            img = numpy.zeros((10, 10, 3), dtype=numpy.uint8)
-            cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            self.opencv_available = True
-            write_log("OpenCV/NumPy 引擎就绪。")
-        except:
-            self.opencv_available = False
-            write_log("OpenCV 引擎不可用。")
+        self.opencv_available = False
+        write_log("精简版引擎就绪：已移除 OpenCV/NumPy，仅支持原图原尺寸精确匹配。")
 
     def stop(self):
         self.stop_requested = True
@@ -1092,11 +1090,8 @@ class RPAEngine:
         return result
 
     def load_and_precompute(self, tasks):
-        if not self.opencv_available: return
         try:
-            import cv2
-            import numpy as np
-            write_log("正在预加载资源...")
+            write_log("正在预加载精简版图片资源...")
             for task in tasks:
                 path = str(task.get("value", ""))
                 if not path or not os.path.exists(path) or ',' in path: continue
@@ -1105,43 +1100,8 @@ class RPAEngine:
                 img = Image.open(path)
                 img.load()
                 self.img_cache[path] = img
-                
-                if task.get("custom_en", False):
-                    try:
-                        s_min = float(task.get("custom_scale_min", self.min_scale))
-                        s_max = float(task.get("custom_scale_max", self.max_scale))
-                        s_step = float(task.get("custom_scale_step", self.scale_step))
-                    except:
-                        s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
-                    use_gray = bool(task.get("custom_gray", self.enable_grayscale))
-                else:
-                    s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
-                    use_gray = self.enable_grayscale
-                    
-                cache_key = f"{path}_{s_min}_{s_max}_{s_step}_{use_gray}"
-                task['cache_key'] = cache_key
-                
-                if s_min != 1.0 or s_max != 1.0:
-                    if cache_key not in self.scaled_templates_cache:
-                        if use_gray:
-                            if img.mode != 'L': img = img.convert('L')
-                            template = np.array(img)
-                        else:
-                            if img.mode != 'RGB': img = img.convert('RGB')
-                            template = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-                            
-                        templates_list = []
-                        safe_step = max(s_step, 0.01)
-                        steps = int((s_max - s_min) / safe_step) + 1
-                        for scale in np.linspace(s_min, s_max, steps):
-                            if 0.99 < scale < 1.01: continue
-                            rw = int(template.shape[1] * scale)
-                            rh = int(template.shape[0] * scale)
-                            if rw < 1 or rh < 1: continue
-                            resized_tpl = cv2.resize(template, (rw, rh))
-                            templates_list.append((scale, resized_tpl))
-                        self.scaled_templates_cache[cache_key] = templates_list
-            write_log("资源预加载完成。")
+                task['cache_key'] = path
+            write_log("精简版图片资源预加载完成。")
         except Exception as e:
             write_log(f"预计算失败: {e}")
 
@@ -1169,98 +1129,18 @@ class RPAEngine:
         offset_x = self.scan_region[0] if self.scan_region else 0
         offset_y = self.scan_region[1] if self.scan_region else 0
 
-        if not self.opencv_available:
-            if img_path in self.img_cache:
-                try: 
-                    res = pyautogui.locate(self.img_cache[img_path], screenshot_pil, confidence=task_conf, grayscale=use_gray)
-                    if res: return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
-                except: pass
-            elif os.path.exists(img_path):
-                 try:
-                    res = pyautogui.locate(img_path, screenshot_pil, confidence=task_conf, grayscale=use_gray)
-                    if res: return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
-                 except: pass
+        target = self.img_cache.get(img_path, img_path)
+        if img_path not in self.img_cache and not os.path.exists(str(img_path)):
             return None
-
-        import cv2
-        import numpy as np
-        
-        screen_np = np.array(screenshot_pil)
-        if use_gray:
-            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2GRAY)
-        else:
-            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
-        
-        if img_path not in self.img_cache:
-            if os.path.exists(img_path):
-                try:
-                    img = Image.open(img_path)
-                    img.load()
-                    self.img_cache[img_path] = img
-                except: return None
-            else: return None
-        
-        pil_template = self.img_cache[img_path]
         try:
-            if use_gray:
-                if pil_template.mode != 'L': pil_template = pil_template.convert('L')
-                tpl_img = np.array(pil_template)
-            else:
-                if pil_template.mode != 'RGB': pil_template = pil_template.convert('RGB')
-                tpl_img = cv2.cvtColor(np.array(pil_template), cv2.COLOR_RGB2BGR)
-                
-            if tpl_img.shape[0] <= screen_img.shape[0] and tpl_img.shape[1] <= screen_img.shape[1]:
-                res = cv2.matchTemplate(screen_img, tpl_img, cv2.TM_CCOEFF_NORMED)
-                min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
-                if max_v >= task_conf:
-                    h, w = tpl_img.shape[:2]
-                    return (max_l[0] + w//2 + offset_x, max_l[1] + h//2 + offset_y, 1.0)
+            res = pyautogui.locate(target, screenshot_pil)
+            if res:
+                return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
         except: pass
-        
-        if cache_key in self.scaled_templates_cache:
-            for scale, resized_tpl in self.scaled_templates_cache[cache_key]:
-                if self.check_stop_flag(): return None
-                try:
-                    if resized_tpl.shape[0] > screen_img.shape[0] or resized_tpl.shape[1] > screen_img.shape[1]: continue
-                    res = cv2.matchTemplate(screen_img, resized_tpl, cv2.TM_CCOEFF_NORMED)
-                    min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
-                    if max_v >= task_conf:
-                        h, w = resized_tpl.shape[:2]
-                        return (max_l[0] + w//2 + offset_x, max_l[1] + h//2 + offset_y, scale)
-                except: continue
         return None
 
     def _collect_template_matches(self, screen_img, tpl_img, task_conf, offset_x, offset_y, scale):
-        import cv2
-        import numpy as np
-
-        if tpl_img.shape[0] > screen_img.shape[0] or tpl_img.shape[1] > screen_img.shape[1]:
-            return []
-
-        res = cv2.matchTemplate(screen_img, tpl_img, cv2.TM_CCOEFF_NORMED)
-        h, w = tpl_img.shape[:2]
-        kernel_w = max(3, int(w * 0.6))
-        kernel_h = max(3, int(h * 0.6))
-        peak_map = cv2.dilate(res, np.ones((kernel_h, kernel_w), dtype=np.uint8))
-        ys, xs = np.where((res >= task_conf) & (res == peak_map))
-        if len(xs) == 0:
-            return []
-
-        scores = res[ys, xs]
-        if len(xs) > 2000:
-            keep = np.argpartition(scores, -2000)[-2000:]
-            xs, ys, scores = xs[keep], ys[keep], scores[keep]
-
-        matches = []
-        for x, y, score in zip(xs, ys, scores):
-            matches.append({
-                "x": float(x + w // 2 + offset_x),
-                "y": float(y + h // 2 + offset_y),
-                "scale": float(scale),
-                "score": float(score),
-                "radius": max(4.0, min(w, h) * 0.55)
-            })
-        return matches
+        return []
 
     def _dedupe_targets(self, matches):
         accepted = []
@@ -1358,59 +1238,21 @@ class RPAEngine:
         offset_x = self.scan_region[0] if self.scan_region else 0
         offset_y = self.scan_region[1] if self.scan_region else 0
 
-        if not self.opencv_available:
-            try:
-                target = self.img_cache.get(img_path, img_path)
-                boxes = list(pyautogui.locateAll(target, screenshot_pil, confidence=task_conf, grayscale=use_gray))
-                matches = [{
-                    "x": box.left + (box.width / 2) + offset_x,
-                    "y": box.top + (box.height / 2) + offset_y,
-                    "scale": 1.0,
-                    "score": 1.0,
-                    "radius": max(4.0, min(box.width, box.height) * 0.55)
-                } for box in boxes]
-                return [(p["x"], p["y"], p["scale"], p["score"]) for p in self._sort_targets_for_click(self._dedupe_targets(matches))]
-            except:
-                one = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
-                return [(one[0], one[1], one[2], task_conf)] if one else []
-
-        import cv2
-        import numpy as np
-
-        screen_np = np.array(screenshot_pil)
-        if use_gray:
-            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2GRAY)
-        else:
-            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
-
-        if img_path not in self.img_cache:
-            if os.path.exists(img_path):
-                try:
-                    img = Image.open(img_path)
-                    img.load()
-                    self.img_cache[img_path] = img
-                except: return []
-            else: return []
-
-        pil_template = self.img_cache[img_path]
-        matches = []
+        target = self.img_cache.get(img_path, img_path)
+        if img_path not in self.img_cache and not os.path.exists(str(img_path)):
+            return []
         try:
-            if use_gray:
-                if pil_template.mode != 'L': pil_template = pil_template.convert('L')
-                tpl_img = np.array(pil_template)
-            else:
-                if pil_template.mode != 'RGB': pil_template = pil_template.convert('RGB')
-                tpl_img = cv2.cvtColor(np.array(pil_template), cv2.COLOR_RGB2BGR)
-
-            matches.extend(self._collect_template_matches(screen_img, tpl_img, task_conf, offset_x, offset_y, 1.0))
-        except: pass
-
-        if cache_key in self.scaled_templates_cache:
-            for scale, resized_tpl in self.scaled_templates_cache[cache_key]:
-                if self.check_stop_flag(): return []
-                try:
-                    matches.extend(self._collect_template_matches(screen_img, resized_tpl, task_conf, offset_x, offset_y, scale))
-                except: continue
+            boxes = list(pyautogui.locateAll(target, screenshot_pil))
+            matches = [{
+                "x": box.left + (box.width / 2) + offset_x,
+                "y": box.top + (box.height / 2) + offset_y,
+                "scale": 1.0,
+                "score": 1.0,
+                "radius": max(4.0, min(box.width, box.height) * 0.55)
+            } for box in boxes]
+        except:
+            one = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
+            return [(one[0], one[1], one[2], 1.0)] if one else []
 
         targets = self._sort_targets_for_click(self._dedupe_targets(matches))
         return [(p["x"], p["y"], p["scale"], p["score"]) for p in targets]
@@ -2099,7 +1941,7 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改v1.3)")
+        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改v1.3 精简版)")
         self.resize(800, 850)
         self.engine = RPAEngine()
         
@@ -2244,6 +2086,12 @@ class RPAWindow(QMainWindow):
         gl1.addStretch()
         g1.set_content_layout(gl1)
         settings_content_layout.addWidget(g1)
+        if SLIM_BUILD:
+            g1.hide()
+            slim_note = QLabel("精简版识别模式：已去掉相似度、缩放识别、灰度识别和 OpenCV/NumPy 运行库，仅按原图原尺寸精确匹配。")
+            slim_note.setStyleSheet("color: #666; font-weight: bold;")
+            slim_note.setWordWrap(True)
+            settings_content_layout.addWidget(slim_note)
         
         # 2. 避让设置
         g_dodge = CollapsibleSection("避让设置")
