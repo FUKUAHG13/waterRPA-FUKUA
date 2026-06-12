@@ -27,7 +27,7 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog, QSplitter,
                                QDialog, QDialogButtonBox, QFormLayout)
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QSettings, QPoint
-from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion
+from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion, QDrag, QPixmap
 import pyperclip
 from PIL import Image
 import pyautogui
@@ -310,6 +310,10 @@ class TaskConfigDialog(QDialog):
         self.fail_limit_edit.setFixedWidth(90)
         self.fail_limit_edit.setToolTip("例如填 1 表示失败一次就执行下一步；填 3 表示连续失败三次后才放弃本步。")
 
+        self.no_skip_wait_chk = QCheckBox("禁止跳过：失败后一直等待本步骤")
+        self.no_skip_wait_chk.setChecked(config_bool(data.get("no_skip_wait", False)))
+        self.no_skip_wait_chk.setToolTip("开启后，本步骤执行失败不会进入下一步，会按全局“识别频率”反复等待并重试，直到成功或达到单步超时。")
+
         self.success_skip_edit = QLineEdit(str(data.get("success_skip", "0")))
         self.success_skip_edit.setFixedWidth(90)
         self.success_skip_edit.setToolTip("本步骤成功后跳过后续 N 步。填 0 表示不跳过。")
@@ -331,12 +335,13 @@ class TaskConfigDialog(QDialog):
         control_form.addRow("同点点击上限:", self.point_limit_chk)
         control_form.addRow("上限次数:", self.point_limit_count_edit)
         control_form.addRow("连续失败次数:", self.fail_limit_edit)
+        control_form.addRow("禁止跳过:", self.no_skip_wait_chk)
         control_form.addRow("成功后跳过:", self.success_skip_edit)
         control_form.addRow("成功后跳至:", self.success_jump_edit)
         control_form.addRow("失败后跳过:", self.fail_skip_edit)
         control_form.addRow("失败后跳至:", self.fail_jump_edit)
 
-        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。步号从 1 开始。")
+        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。开启禁止跳过后，失败分支会等到成功或超时后再处理。")
         control_note.setStyleSheet("color: #666;")
         control_note.setWordWrap(True)
         control_form.addRow("", control_note)
@@ -395,6 +400,7 @@ class TaskConfigDialog(QDialog):
             "point_limit_en": self.point_limit_chk.isChecked() and self.point_limit_available,
             "point_limit_count": self.point_limit_count_edit.text(),
             "fail_limit": self.fail_limit_edit.text(),
+            "no_skip_wait": self.no_skip_wait_chk.isChecked(),
             "success_skip": self.success_skip_edit.text(),
             "success_jump": self.success_jump_edit.text(),
             "fail_skip": self.fail_skip_edit.text(),
@@ -1014,8 +1020,10 @@ class RPAEngine:
         self.click_hold = 0.04
         self.settlement_wait = 0.0
         self.timeout_val = 0.0
-        self.detect_delay = 0.01
+        self.timeout_stop = False
+        self.detect_delay = 0.0
         self.playback_speed = 1.0
+        self.start_step_index = 0
         self.multi_target_mode = "最佳一个"
         self.multi_target_order = "从上到下"
         self.loop_mode = "单次"
@@ -1074,6 +1082,16 @@ class RPAEngine:
 
     def check_stop_flag(self):
         return self.stop_requested
+
+    def wait_recognition_interval(self):
+        if self.detect_delay <= 0:
+            return True
+        end_time = time.time() + self.detect_delay
+        while time.time() < end_time:
+            if self.check_stop_flag():
+                return False
+            time.sleep(min(0.05, max(0.0, end_time - time.time())))
+        return True
 
     def as_bool(self, value):
         if isinstance(value, str):
@@ -1466,9 +1484,9 @@ class RPAEngine:
 
         while True:
             if self.check_stop_flag(): return "stopped"
-            if self.timeout_val > 0.001 and (time.time() - start_time > self.timeout_val): 
+            if self.timeout_val > 0 and (time.time() - start_time > self.timeout_val): 
                 if self.log_level >= 1:
-                    self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 等待目标超时，已跳过</font>")
+                    self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 等待目标超时</font>")
                 return "timeout"
 
             if coord:
@@ -1524,13 +1542,14 @@ class RPAEngine:
             else:
                 if reTry != -1:
                     if self.log_level >= 1:
-                        self.log(f"<font color='orange'>    [跳过] 循环#{step_info['loop']} 步{step_info['step']}: 未能识别到目标图片 ({os.path.basename(img_path)})</font>")
+                        self.log(f"<font color='orange'>    [未找到] 循环#{step_info['loop']} 步{step_info['step']}: 未能识别到目标图片 ({os.path.basename(img_path)})</font>")
                     return "not_found"
                 else:
                     if not waiting_logged and self.log_level >= 1:
                         self.log(f"    -> 未发现目标，进入持续监听等待状态...")
                         waiting_logged = True
-                    time.sleep(self.detect_delay)
+                    if not self.wait_recognition_interval():
+                        return "stopped"
                     continue
 
     def mouseDrag(self, button, val, step_info):
@@ -1661,7 +1680,7 @@ class RPAEngine:
 
                 self.report_status(loop_count, 0, len(tasks), "")
 
-                idx = 0
+                idx = min(max(int(getattr(self, "start_step_index", 0)), 0), max(len(tasks) - 1, 0))
                 while idx < len(tasks):
                     task = tasks[idx]
                     
@@ -1672,6 +1691,7 @@ class RPAEngine:
                     cmd = task.get("type")
                     val = task.get("value")
                     retry = task.get("retry", 1)
+                    no_skip_wait = self.as_bool(task.get("no_skip_wait", False))
                     try: success_skip = max(0, int(float(task.get("success_skip", 0))))
                     except: success_skip = 0
                     try: success_jump = max(0, int(float(task.get("success_jump", 0))))
@@ -1711,9 +1731,22 @@ class RPAEngine:
                     success_count = 0
                     consecutive_failures = 0
                     step_failed_for_branch = False
+                    step_wall_start = time.time()
 
                     while target_successes is None or success_count < target_successes:
                         if self.check_stop_flag(): return
+                        if no_skip_wait and self.timeout_val > 0 and (time.time() - step_wall_start > self.timeout_val):
+                            status = "timeout"
+                            step_duration = time.time() - step_wall_start
+                            if self.log_level >= 0:
+                                self.log(f"<font color='orange'>循环 #{loop_count} 步 {idx+1} ({cmd_name}) 禁止跳过等待超时，耗时: {step_duration:.2f}s</font>")
+                            if self.timeout_stop:
+                                if self.log_level >= 0:
+                                    self.log(f"<font color='red'><b>    -> [超时急停] 步骤 {idx+1} 达到单步超时，已停止全部循环。</b></font>")
+                                self.stop()
+                                return
+                            step_failed_for_branch = True
+                            break
                         attempt += 1
 
                         if target_successes is None:
@@ -1728,6 +1761,9 @@ class RPAEngine:
                         self.report_status(loop_count, idx + 1, len(tasks), status_cmd_name)
                         step_start_time = time.time()
 
+                        needs_recognition_wait = cmd in [1.0, 2.0, 3.0, 8.0] and not self.parse_coordinate(val)
+                        if (needs_recognition_wait or no_skip_wait) and not self.wait_recognition_interval():
+                            return
                         status = self.execute_task_once(cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count)
 
                         step_duration = time.time() - step_start_time
@@ -1735,8 +1771,12 @@ class RPAEngine:
                             status_str = "完成"
                             color = "gray"
                             if status == "success": status_str = "完成"; color = "gray"
-                            elif status == "timeout": status_str = "超时跳过"; color = "orange"
-                            elif status == "not_found": status_str = "未找目标跳过"; color = "orange"
+                            elif status == "timeout":
+                                status_str = "超时急停" if self.timeout_stop else "超时失败"
+                                color = "red" if self.timeout_stop else "orange"
+                            elif status == "not_found":
+                                status_str = "未找目标，继续等待" if no_skip_wait else "未找目标失败"
+                                color = "orange"
                             elif status == "error": status_str = "执行异常"; color = "red"
                             elif status == "stopped": status_str = "已停止"; color = "red"
 
@@ -1746,7 +1786,17 @@ class RPAEngine:
                         if status == "stopped":
                             return
 
+                        if status == "timeout" and self.timeout_stop:
+                            if self.log_level >= 0:
+                                self.log(f"<font color='red'><b>    -> [超时急停] 步骤 {idx+1} 达到单步超时，已停止全部循环。</b></font>")
+                            self.stop()
+                            return
+
                         if status in ["timeout", "not_found", "error"]:
+                            if no_skip_wait and status != "timeout":
+                                if self.log_level >= 1:
+                                    self.log(f"    -> 本步骤已启用禁止跳过，将继续等待本步骤成功。")
+                                continue
                             consecutive_failures += 1
                             if consecutive_failures >= fail_limit:
                                 step_failed_for_branch = True
@@ -1756,9 +1806,6 @@ class RPAEngine:
                         else:
                             success_count += 1
                             consecutive_failures = 0
-
-                        if self.detect_delay > 0:
-                            time.sleep(self.detect_delay)
 
                     next_idx = idx + 1
                     if step_failed_for_branch:
@@ -1835,11 +1882,13 @@ class TaskRow(QFrame):
             "success_jump": "0",
             "fail_skip": "0",
             "fail_jump": "0",
+            "no_skip_wait": False,
             "point_limit_en": False,
             "point_limit_count": "0"
         }
         
         self.setFrameShape(QFrame.StyledPanel)
+        self.set_selected(False)
         self.layout = QHBoxLayout(self)
         self.layout.setContentsMargins(2, 2, 2, 2)
         
@@ -1891,6 +1940,12 @@ class TaskRow(QFrame):
         self.parent_item = item
         self.sync_data() 
 
+    def set_selected(self, selected):
+        if selected:
+            self.setStyleSheet("TaskRow { background-color: #D9ECFF; border: 2px solid #2196F3; border-radius: 4px; }")
+        else:
+            self.setStyleSheet("TaskRow { background-color: transparent; border: 1px solid #CFCFCF; border-radius: 4px; }")
+
     def sync_data(self):
         text = self.type_combo.currentText()
         coord_mode = self.is_direct_coordinate_value(text)
@@ -1908,6 +1963,14 @@ class TaskRow(QFrame):
             
         if getattr(self, 'parent_item', None):
             self.parent_item.setData(Qt.UserRole, self.get_data())
+            self.parent_item.setData(Qt.UserRole + 1, self.drag_summary())
+            self.parent_item.setText("")
+
+    def drag_summary(self):
+        value = self.value_input.text().replace("\n", " ").strip()
+        if len(value) > 80:
+            value = value[:77] + "..."
+        return f"{self.index_label.text()} {self.type_combo.currentText()} | {value}"
 
     def is_coordinate_pickable(self, text=None):
         if text is None:
@@ -2031,6 +2094,7 @@ class TaskRow(QFrame):
             "success_jump": data.get("success_jump", "0"),
             "fail_skip": data.get("fail_skip", "0"),
             "fail_jump": data.get("fail_jump", "0"),
+            "no_skip_wait": data.get("no_skip_wait", False),
             "point_limit_en": data.get("point_limit_en", False),
             "point_limit_count": data.get("point_limit_count", "0")
         }
@@ -2081,9 +2145,113 @@ class DraggableListWidget(QListWidget):
         self.setDragDropMode(QAbstractItemView.InternalMove)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.setDropIndicatorShown(False)
+        self.drop_line_row = None
+        self.drop_line_after = False
+
+    def _event_pos(self, event):
+        if hasattr(event, "position"):
+            return event.position().toPoint()
+        return event.pos()
+
+    def _update_drop_line(self, event):
+        pos = self._event_pos(event)
+        item = self.itemAt(pos)
+        if item is None:
+            self.drop_line_row = self.count() - 1 if self.count() else 0
+            self.drop_line_after = True
+            self.viewport().update()
+            return
+
+        row = self.row(item)
+        rect = self.visualItemRect(item)
+        self.drop_line_row = row
+        self.drop_line_after = pos.y() > rect.center().y()
+        self.viewport().update()
+
+    def dragMoveEvent(self, event):
+        self._update_drop_line(event)
+        super().dragMoveEvent(event)
+
+    def dragLeaveEvent(self, event):
+        self.drop_line_row = None
+        self.viewport().update()
+        super().dragLeaveEvent(event)
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.drop_line_row is None or self.count() == 0:
+            return
+
+        row = max(0, min(self.drop_line_row, self.count() - 1))
+        rect = self.visualItemRect(self.item(row))
+        y = rect.bottom() + 1 if self.drop_line_after else rect.top()
+
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor(255, 255, 255), 12, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(6, y, self.viewport().width() - 6, y)
+        painter.setPen(QPen(QColor(0, 0, 0), 8, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(6, y, self.viewport().width() - 6, y)
+
+    def _drag_preview_pixmap(self, item):
+        widget = self.itemWidget(item)
+        if widget:
+            pixmap = widget.grab()
+            if not pixmap.isNull():
+                return pixmap
+
+        summary = item.data(Qt.UserRole + 1) or item.text() or "正在移动步骤"
+        preview_width = max(260, min(self.viewport().width() - 12, 900))
+        preview_height = max(44, min(item.sizeHint().height(), 72))
+
+        pixmap = QPixmap(preview_width, preview_height)
+        pixmap.fill(Qt.transparent)
+
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setBrush(QColor(245, 250, 255, 245))
+        painter.setPen(QPen(QColor(33, 150, 243), 2))
+        painter.drawRoundedRect(QRect(1, 1, preview_width - 2, preview_height - 2), 5, 5)
+
+        text_rect = QRect(14, 0, preview_width - 28, preview_height)
+        text = painter.fontMetrics().elidedText(summary, Qt.ElideRight, text_rect.width())
+        painter.setPen(QColor(30, 30, 30))
+        painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignLeft, text)
+        painter.end()
+        return pixmap
+
+    def startDrag(self, supported_actions):
+        selected_items = self.selectedItems()
+        if not selected_items:
+            return
+
+        item = selected_items[0]
+        drag = QDrag(self)
+        drag.setMimeData(self.mimeData(selected_items))
+
+        pixmap = self._drag_preview_pixmap(item)
+        if not pixmap.isNull():
+            drag.setPixmap(pixmap)
+            rect = self.visualItemRect(item)
+            cursor_pos = self.viewport().mapFromGlobal(QCursor.pos())
+            if rect.isValid() and rect.contains(cursor_pos):
+                hotspot = cursor_pos - rect.topLeft()
+                hotspot.setX(max(1, min(hotspot.x(), pixmap.width() - 1)))
+                hotspot.setY(max(1, min(hotspot.y(), pixmap.height() - 1)))
+            else:
+                hotspot = QPoint(min(36, pixmap.width() // 2), pixmap.height() // 2)
+            drag.setHotSpot(hotspot)
+
+        drag.exec(Qt.MoveAction)
+        self.drop_line_row = None
+        self.viewport().update()
 
     def dropEvent(self, event):
+        if hasattr(self.window(), 'push_undo_state'):
+            self.window().push_undo_state()
         super().dropEvent(event)
+        self.drop_line_row = None
         for i in range(self.count()):
             item = self.item(i)
             if self.itemWidget(item) is None:
@@ -2119,6 +2287,10 @@ class RPAWindow(QMainWindow):
         self.hotkey_stop_vk = 0x79  
         self.current_process = None
         self.running_overlay = None
+        self.task_clipboard = None
+        self.undo_stack = []
+        self.redo_stack = []
+        self.restoring_history = False
         if HAS_PSUTIL:
             try: self.current_process = psutil.Process()
             except: pass
@@ -2170,6 +2342,16 @@ class RPAWindow(QMainWindow):
         add_btn = QPushButton("+ 新增指令")
         add_btn.clicked.connect(lambda: self.add_row())
         top_bar.addWidget(add_btn)
+
+        insert_btn = QPushButton("插入")
+        insert_btn.setToolTip("在当前选中步骤前插入一条新指令")
+        insert_btn.clicked.connect(self.insert_row_before_selected)
+        top_bar.addWidget(insert_btn)
+
+        redo_btn = QPushButton("重做")
+        redo_btn.setToolTip("恢复刚撤销的步骤列表操作 (Ctrl+Y)")
+        redo_btn.clicked.connect(self.redo_task_change)
+        top_bar.addWidget(redo_btn)
         
         record_btn = QPushButton("⏺ 操作录制")
         record_btn.setStyleSheet("color: #E91E63; font-weight: bold;")
@@ -2180,13 +2362,8 @@ class RPAWindow(QMainWindow):
         region_btn.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
         region_btn.clicked.connect(self.open_region_selector)
         top_bar.addWidget(region_btn)
-
-        multi_region_btn = QPushButton("🧩 高级区域")
-        multi_region_btn.setStyleSheet("background-color: #673AB7; color: white; font-weight: bold;")
-        multi_region_btn.clicked.connect(self.open_multi_region_selector)
-        top_bar.addWidget(multi_region_btn)
         
-        top_bar.addWidget(HelpBtn("【设定识别区域】\n如CPU占用较高，务必使用此功能！\n普通区域：框选一个矩形范围。\n高级区域：连续框选多个矩形范围，右键完成。\n搜索范围越小，找图速度越快。"))
+        top_bar.addWidget(HelpBtn("【设定识别区域】\n如CPU占用较高，务必使用此功能！\n左键拖拽框选一个或多个区域，右键完成。\n只画一个区域就是普通用法；连续画多个区域就是高级合并用法。\n搜索范围越小，找图速度越快。"))
         top_bar.addStretch()
         main_layout.addLayout(top_bar)
 
@@ -2281,10 +2458,13 @@ class RPAWindow(QMainWindow):
         gl2.addWidget(HelpBtn("【结算缓冲】 点击后的等待时间"))
         gl2.addSpacing(15)
         gl2.addWidget(QLabel("超时(s):")); self.timeout = QLineEdit("0.0"); self.timeout.setFixedWidth(70); gl2.addWidget(self.timeout)
-        gl2.addWidget(HelpBtn("【单步超时】 0.0=扫一眼没找到直接过"))
+        gl2.addWidget(HelpBtn("【单步超时】\n0 表示不设置等待上限。\n未开启“超时急停”时：达到超时会把本步骤视为失败，再按小齿轮里的失败跳过/跳至规则处理。\n开启“超时急停”时：达到超时会立即停止整个脚本和后续循环。"))
+        self.timeout_stop_chk = QCheckBox("超时急停")
+        self.timeout_stop_chk.setToolTip("开启后，任意步骤达到单步超时都会立即停止全部循环，不再执行后续步骤。")
+        gl2.addWidget(self.timeout_stop_chk)
         gl2.addSpacing(15)
-        gl2.addWidget(QLabel("频率(s):")); self.detect_delay = QLineEdit("0.01"); self.detect_delay.setFixedWidth(70); gl2.addWidget(self.detect_delay)
-        gl2.addWidget(HelpBtn("【找图频率】 没找到图时的等待时间。默认 0.01"))
+        gl2.addWidget(QLabel("识别频率(s):")); self.detect_delay = QLineEdit("0"); self.detect_delay.setFixedWidth(70); gl2.addWidget(self.detect_delay)
+        gl2.addWidget(HelpBtn("【识别频率】\n每次执行识别/重试前先等待这么多秒，用于降低CPU占用。\n0 表示不额外等待，速度最快但CPU压力更高。"))
         gl2.addSpacing(15)
         gl2.addWidget(QLabel("倍速:")); self.playback_speed = QLineEdit("1.0"); self.playback_speed.setFixedWidth(70); gl2.addWidget(self.playback_speed)
         gl2.addWidget(HelpBtn("【倍速执行】 用于缩放录制的等待指令时间，> 1 为加速"))
@@ -2360,6 +2540,13 @@ class RPAWindow(QMainWindow):
         self.run_status_pos_combo.setFixedWidth(100)
         gl3_r3.addWidget(self.run_status_pos_combo)
         gl3_r3.addWidget(HelpBtn("【运行状态提示】\n脚本运行时在屏幕角落显示“脚本正在执行中”、当前循环、当前步骤和已运行时间。"))
+        gl3_r3.addSpacing(15)
+        gl3_r3.addWidget(QLabel("从第"))
+        self.start_step_edit = QLineEdit("1")
+        self.start_step_edit.setFixedWidth(60)
+        gl3_r3.addWidget(self.start_step_edit)
+        gl3_r3.addWidget(QLabel("步开始"))
+        gl3_r3.addWidget(HelpBtn("【从第X步开始执行】\n默认 1。启动脚本后每轮循环都从这里开始；成功/失败跳至仍按列表中的实际步号计算。"))
         gl3_r3.addStretch()
         
         gl3_main.addLayout(gl3_r1)
@@ -2373,6 +2560,11 @@ class RPAWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Vertical)
         
         self.task_list = DraggableListWidget()
+        self.task_list.itemSelectionChanged.connect(self.update_selection_highlight)
+        self.task_list.setStyleSheet("""
+            QListWidget::item:selected { background: #D9ECFF; border: 1px solid #2196F3; }
+            QListWidget::item { margin: 1px; }
+        """)
         self.splitter.addWidget(self.task_list)
         
         bottom_widget = QWidget()
@@ -2502,12 +2694,12 @@ class RPAWindow(QMainWindow):
             "conf": "0.8", "scale_min": "0.8", "scale_max": "1.2", "scale_step": "0.05", "gray_en": True,
             "dodge_x1": "100", "dodge_y1": "100", "dodge_x2": "200", "dodge_y2": "100",
             "dodge_en": False, "dbl_dodge": False, "dbl_wait": "0.015",
-            "move_spd": "0.0", "click_hld": "0.04", "settle": "0.0", "timeout": "0.0", "detect_delay": "0.01", "playback_speed": "1.0",
+            "move_spd": "0.0", "click_hld": "0.04", "settle": "0.0", "timeout": "0.0", "timeout_stop": False, "detect_delay": "0", "playback_speed": "1.0",
             "multi_target_mode": "最佳一个", "multi_target_order": "从上到下",
             "hotkey_start": "F9", "hotkey_stop": "F10", "log_level": 0,
             "tm_fs": True, "tr_fs": True, "key_fs": True,
             "log_f": False, "log_ui": True, "mini": False, "top": False,
-            "run_status_tip": True, "run_status_pos": "右上角",
+            "run_status_tip": True, "run_status_pos": "右上角", "start_step": "1",
             "loop_mode": "单次", "loop_val": "10",
             "scan_region": None, "scan_regions": [],
             "tasks": []
@@ -2525,12 +2717,12 @@ class RPAWindow(QMainWindow):
             "conf": self.conf_edit.text(), "scale_min": self.scale_min.text(), "scale_max": self.scale_max.text(), "scale_step": self.scale_step.text(), "gray_en": self.gray_chk.isChecked(),
             "dodge_x1": self.dodge_x1.text(), "dodge_y1": self.dodge_y1.text(), "dodge_x2": self.dodge_x2.text(), "dodge_y2": self.dodge_y2.text(),
             "dodge_en": self.dodge_chk.isChecked(), "dbl_dodge": self.double_dodge_chk.isChecked(), "dbl_wait": self.dbl_wait.text(),
-            "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "detect_delay": self.detect_delay.text(), "playback_speed": self.playback_speed.text(),
+            "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "timeout_stop": self.timeout_stop_chk.isChecked(), "detect_delay": self.detect_delay.text(), "playback_speed": self.playback_speed.text(),
             "multi_target_mode": self.multi_mode_combo.currentText(), "multi_target_order": self.multi_order_combo.currentText(),
             "hotkey_start": self.hotkey_start_combo.currentText(), "hotkey_stop": self.hotkey_stop_combo.currentText(), "log_level": self.log_level_combo.currentIndex(),
             "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(),
             "log_f": self.log_file_chk.isChecked(), "log_ui": self.log_ui_chk.isChecked(), "mini": self.mini_chk.isChecked(), "top": self.top_chk.isChecked(),
-            "run_status_tip": self.run_status_chk.isChecked(), "run_status_pos": self.run_status_pos_combo.currentText(),
+            "run_status_tip": self.run_status_chk.isChecked(), "run_status_pos": self.run_status_pos_combo.currentText(), "start_step": self.start_step_edit.text(),
             "loop_mode": self.loop_combo.currentText(), "loop_val": self.loop_val_edit.text(),
             "scan_region": self.engine.scan_region, "scan_regions": self.engine.scan_regions,
             "tasks": tasks
@@ -2555,7 +2747,8 @@ class RPAWindow(QMainWindow):
             self.click_hld.setText(str(cfg.get("click_hld", "0.04")))
             self.settle.setText(str(cfg.get("settle", "0.0")))
             self.timeout.setText(str(cfg.get("timeout", "0.0")))
-            self.detect_delay.setText(str(cfg.get("detect_delay", "0.01")))
+            self.timeout_stop_chk.setChecked(config_bool(cfg.get("timeout_stop", False)))
+            self.detect_delay.setText(str(cfg.get("detect_delay", "0")))
             self.playback_speed.setText(str(cfg.get("playback_speed", "1.0")))
             self.multi_mode_combo.setCurrentText(str(cfg.get("multi_target_mode", "最佳一个")))
             self.multi_order_combo.setCurrentText(str(cfg.get("multi_target_order", "从上到下")))
@@ -2575,6 +2768,7 @@ class RPAWindow(QMainWindow):
             self.top_chk.setChecked(bool(cfg.get("top", False)))
             self.run_status_chk.setChecked(bool(cfg.get("run_status_tip", True)))
             self.run_status_pos_combo.setCurrentText(str(cfg.get("run_status_pos", "右上角")))
+            self.start_step_edit.setText(str(cfg.get("start_step", "1")))
             
             self.loop_combo.setCurrentText(str(cfg.get("loop_mode", "单次")))
             self.loop_val_edit.setText(str(cfg.get("loop_val", "10")))
@@ -2699,9 +2893,10 @@ class RPAWindow(QMainWindow):
         self.click_hld.editingFinished.connect(lambda: self.log_setting_change("按住时长(s)", self.click_hld.text()))
         self.settle.editingFinished.connect(lambda: self.log_setting_change("结算缓冲(s)", self.settle.text()))
         self.timeout.editingFinished.connect(lambda: self.log_setting_change("单步超时(s)", self.timeout.text()))
-        self.detect_delay.editingFinished.connect(lambda: self.log_setting_change("检测频率(s)", self.detect_delay.text()))
+        self.detect_delay.editingFinished.connect(lambda: self.log_setting_change("识别频率(s)", self.detect_delay.text()))
         self.playback_speed.editingFinished.connect(lambda: self.log_setting_change("倍速执行", self.playback_speed.text()))
         self.loop_val_edit.editingFinished.connect(lambda: self.log_setting_change("循环参数", self.loop_val_edit.text()))
+        self.start_step_edit.editingFinished.connect(lambda: self.log_setting_change("从第X步开始", self.start_step_edit.text()))
 
         self.gray_chk.stateChanged.connect(lambda s: self.log_setting_change("灰度匹配", "开启" if s else "关闭"))
         self.dodge_chk.stateChanged.connect(lambda s: self.log_setting_change("启用避让", "开启" if s else "关闭"))
@@ -2713,6 +2908,7 @@ class RPAWindow(QMainWindow):
         self.log_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("显示界面日志", "开启" if s else "关闭"))
         self.mini_chk.stateChanged.connect(lambda s: self.log_setting_change("启动时最小化", "开启" if s else "关闭"))
         self.run_status_chk.stateChanged.connect(lambda s: self.log_setting_change("运行状态提示", "开启" if s else "关闭"))
+        self.timeout_stop_chk.stateChanged.connect(lambda s: self.log_setting_change("超时急停", "开启" if s else "关闭"))
         
         self.hotkey_start_combo.currentTextChanged.connect(lambda t: self.log_setting_change("启动热键", t))
         self.hotkey_stop_combo.currentTextChanged.connect(lambda t: self.log_setting_change("停止热键", t))
@@ -2810,12 +3006,11 @@ class RPAWindow(QMainWindow):
             return
 
     def open_region_selector(self):
-        self.region_win = RegionWindow(multi=False)
-        self.region_win.region_selected.connect(self.on_region_selected)
-
-    def open_multi_region_selector(self):
         self.region_win = RegionWindow(multi=True)
         self.region_win.regions_selected.connect(self.on_regions_selected)
+
+    def open_multi_region_selector(self):
+        self.open_region_selector()
 
     def on_region_selected(self, rect_tuple):
         self.engine.scan_region = rect_tuple
@@ -2876,26 +3071,167 @@ class RPAWindow(QMainWindow):
         for i in range(self.task_list.count()):
             item = self.task_list.item(i)
             widget = self.task_list.itemWidget(item)
+            if widget is None:
+                data = item.data(Qt.UserRole)
+                if data:
+                    self.restore_row_widget(item, data)
+                    widget = self.task_list.itemWidget(item)
             if widget and hasattr(widget, 'set_index'):
                 widget.set_index(i + 1)
+                item.setData(Qt.UserRole, widget.get_data())
+                if hasattr(widget, 'drag_summary'):
+                    item.setData(Qt.UserRole + 1, widget.drag_summary())
+                item.setText("")
+        self.update_selection_highlight()
 
-    def add_row(self, data=None):
+    def selected_row_index(self):
+        row = self.task_list.currentRow()
+        return row if row >= 0 else None
+
+    def snapshot_tasks(self):
+        tasks = []
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            widget = self.task_list.itemWidget(item)
+            if widget:
+                tasks.append(widget.get_data())
+            else:
+                tasks.append(item.data(Qt.UserRole))
+        return json.loads(json.dumps(tasks, ensure_ascii=False))
+
+    def push_undo_state(self):
+        if self.restoring_history or self.is_switching_profile:
+            return
+        self.undo_stack.append(self.snapshot_tasks())
+        if len(self.undo_stack) > 50:
+            self.undo_stack.pop(0)
+        self.redo_stack.clear()
+
+    def restore_task_snapshot(self, tasks):
+        self.restoring_history = True
+        try:
+            self.task_list.clear()
+            for data in tasks:
+                self.add_row(data, record_undo=False, select=False)
+            self.update_indexes()
+        finally:
+            self.restoring_history = False
+
+    def restore_row_widget(self, item, data):
         row_widget = TaskRow(delete_callback=self.del_row)
-        if data: row_widget.set_data(data)
-        item = QListWidgetItem(self.task_list)
+        if data:
+            row_widget.set_data(data)
         item.setSizeHint(row_widget.sizeHint())
         self.task_list.setItemWidget(item, row_widget)
         row_widget.set_parent_item(item)
         item.setData(Qt.UserRole, row_widget.get_data())
+        item.setData(Qt.UserRole + 1, row_widget.drag_summary())
+        item.setText("")
+
+    def update_selection_highlight(self):
+        current = self.task_list.currentItem()
+        for i in range(self.task_list.count()):
+            item = self.task_list.item(i)
+            widget = self.task_list.itemWidget(item)
+            if widget and hasattr(widget, "set_selected"):
+                widget.set_selected(item is current)
+
+    def add_row(self, data=None, index=None, record_undo=True, select=True):
+        if record_undo:
+            self.push_undo_state()
+        row_widget = TaskRow(delete_callback=self.del_row)
+        if data: row_widget.set_data(data)
+        item = QListWidgetItem()
+        item.setSizeHint(row_widget.sizeHint())
+        if index is None:
+            self.task_list.addItem(item)
+        else:
+            self.task_list.insertItem(max(0, min(index, self.task_list.count())), item)
+        self.task_list.setItemWidget(item, row_widget)
+        row_widget.set_parent_item(item)
+        item.setData(Qt.UserRole, row_widget.get_data())
+        item.setData(Qt.UserRole + 1, row_widget.drag_summary())
+        item.setText("")
+        if select:
+            self.task_list.setCurrentItem(item)
         self.update_indexes()
 
     def del_row(self, row_widget):
+        self.push_undo_state()
         for i in range(self.task_list.count()):
             item = self.task_list.item(i)
             if self.task_list.itemWidget(item) == row_widget:
                 self.task_list.takeItem(i)
                 break
         self.update_indexes()
+
+    def insert_row_before_selected(self):
+        row = self.selected_row_index()
+        self.add_row(index=(row if row is not None else self.task_list.count()))
+
+    def copy_selected_row(self):
+        row = self.selected_row_index()
+        if row is None:
+            return
+        item = self.task_list.item(row)
+        widget = self.task_list.itemWidget(item)
+        if not widget:
+            return
+        self.task_clipboard = widget.get_data()
+        try:
+            pyperclip.copy(json.dumps({"waterRPA_task": self.task_clipboard}, ensure_ascii=False))
+        except:
+            pass
+        if GLOBAL_CONFIG["log_to_ui"]:
+            self.append_log(f"<font color='gray'>已复制第 {row + 1} 步。</font>")
+
+    def paste_row_after_selected(self):
+        data = self.task_clipboard
+        if data is None:
+            try:
+                clip = json.loads(pyperclip.paste())
+                if isinstance(clip, dict) and "waterRPA_task" in clip:
+                    data = clip["waterRPA_task"]
+            except:
+                data = None
+        if not isinstance(data, dict):
+            return
+        row = self.selected_row_index()
+        insert_at = self.task_list.count() if row is None else row + 1
+        self.add_row(json.loads(json.dumps(data, ensure_ascii=False)), index=insert_at)
+
+    def undo_task_change(self):
+        if not self.undo_stack:
+            return
+        self.redo_stack.append(self.snapshot_tasks())
+        tasks = self.undo_stack.pop()
+        self.restore_task_snapshot(tasks)
+
+    def redo_task_change(self):
+        if not self.redo_stack:
+            return
+        self.undo_stack.append(self.snapshot_tasks())
+        tasks = self.redo_stack.pop()
+        self.restore_task_snapshot(tasks)
+
+    def keyPressEvent(self, event):
+        focus = QApplication.focusWidget()
+        if isinstance(focus, (QLineEdit, QTextEdit)):
+            return super().keyPressEvent(event)
+        if event.modifiers() & Qt.ControlModifier:
+            if event.key() == Qt.Key_C:
+                self.copy_selected_row(); return
+            if event.key() == Qt.Key_V:
+                self.paste_row_after_selected(); return
+            if event.key() == Qt.Key_Z:
+                self.undo_task_change(); return
+            if event.key() == Qt.Key_Y:
+                self.redo_task_change(); return
+            if event.key() == Qt.Key_D:
+                self.insert_row_before_selected(); return
+        if event.key() == Qt.Key_Insert:
+            self.insert_row_before_selected(); return
+        return super().keyPressEvent(event)
 
     def save(self):
         data = self.get_current_ui_config()
@@ -2947,6 +3283,10 @@ class RPAWindow(QMainWindow):
                 QMessageBox.warning(self, "导入失败", str(e))
 
     def validate_tasks(self, tasks):
+        start_step = str(self.start_step_edit.text()).strip()
+        if not start_step.isdigit() or int(start_step) < 1 or int(start_step) > len(tasks):
+            return f"设置里的'从第X步开始执行'必须是 1 到 {len(tasks)} 之间的整数！\n填入内容: {start_step}"
+
         for i, task in enumerate(tasks):
             t = task.get("type")
             v = str(task.get("value", "")).strip()
@@ -3015,9 +3355,11 @@ class RPAWindow(QMainWindow):
             self.engine.click_hld = float(cfg["click_hld"])
             self.engine.settlement_wait = float(cfg["settle"])
             self.engine.timeout_val = float(cfg["timeout"])
+            self.engine.timeout_stop = config_bool(cfg.get("timeout_stop", False))
             self.engine.confidence = float(cfg["conf"])
             self.engine.detect_delay = float(cfg["detect_delay"]) 
             self.engine.playback_speed = float(cfg.get("playback_speed", "1.0"))
+            self.engine.start_step_index = max(0, int(float(cfg.get("start_step", "1"))) - 1)
             self.engine.multi_target_mode = cfg.get("multi_target_mode", "最佳一个")
             self.engine.multi_target_order = cfg.get("multi_target_order", "从上到下")
             
@@ -3041,7 +3383,9 @@ class RPAWindow(QMainWindow):
             multi_info = cfg.get("multi_target_mode", "最佳一个")
             if multi_info == "全部匹配":
                 multi_info = f"{multi_info}/{cfg.get('multi_target_order', '从上到下')}"
-            self.append_log(f"<hr><b><font color='blue'>>>> 引擎启动 ({start_key}启动 / {stop_key}停止) - 方案: {self.current_profile_name} - 日志: {self.log_level_combo.currentText()} - 循环: {self.loop_combo.currentText()} - 多目标: {multi_info}</font></b>")
+            start_step = int(float(cfg.get("start_step", "1")))
+            timeout_mode = "超时急停" if cfg.get("timeout_stop", False) else "超时按失败处理"
+            self.append_log(f"<hr><b><font color='blue'>>>> 引擎启动 ({start_key}启动 / {stop_key}停止) - 方案: {self.current_profile_name} - 日志: {self.log_level_combo.currentText()} - 循环: {self.loop_combo.currentText()} - 起始步: {start_step} - 多目标: {multi_info} - {timeout_mode}</font></b>")
             
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
