@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='waterRPA_full_v1_3',
+    name='waterRPA_full_v1_4',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,5 +40,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='waterRPA_full_v1_3',
+    name='waterRPA_full_v1_4',
 )

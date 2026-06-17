@@ -6,3 +6,4 @@ numpy
 Pillow
 psutil
 pyinstaller
+mss

@@ -8,6 +8,8 @@ import traceback
 import ctypes
 import threading
 import queue
+import hashlib
+import webbrowser
 from ctypes import wintypes
 
 # ---------------------------------------------------------
@@ -237,13 +239,14 @@ class HelpBtn(QPushButton):
         QToolTip.showText(QCursor.pos(), self.tip_text, self, QRect(), 5000)
 
 class TaskConfigDialog(QDialog):
-    def __init__(self, parent, data, image_settings_available=True, point_limit_available=False):
+    def __init__(self, parent, data, image_settings_available=True, point_limit_available=False, coordinate_step_available=False):
         super().__init__(None)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowFlag(Qt.Window, True)
         self.setWindowModality(Qt.NonModal)
         self.image_settings_available = image_settings_available and not SLIM_BUILD
         self.point_limit_available = point_limit_available
+        self.coordinate_step_available = coordinate_step_available
         self.dialog_settings = QSettings(os.path.join(get_base_dir(), "config.ini"), QSettings.IniFormat)
         self.setWindowTitle("步骤设置")
         self.setMinimumSize(560, 560)
@@ -312,6 +315,78 @@ class TaskConfigDialog(QDialog):
         self.point_limit_count_edit.setFixedWidth(90)
         self.point_limit_count_edit.setToolTip("填 0 表示不限制；例如填 1 表示同一个识别点位只点击一次。")
 
+        self.coord_step_chk = QCheckBox("坐标点击启用步进偏移")
+        self.coord_step_chk.setChecked(config_bool(data.get("coord_step_en", False)) and self.coordinate_step_available)
+        self.coord_step_chk.setEnabled(self.coordinate_step_available)
+        self.coord_step_chk.setToolTip("仅对直接输入坐标的点击步骤生效；图片识别点击会自动忽略。")
+        self.coord_step_chk.toggled.connect(self.update_coord_step_ui)
+
+        self.coord_step_every_edit = QLineEdit(str(data.get("coord_step_every", "1")))
+        self.coord_step_every_edit.setFixedWidth(70)
+        self.coord_step_every_edit.setToolTip("每执行本坐标点击步骤多少次后，移动到下一个点击位置。")
+
+        self.coord_step_direction_combo = QComboBox()
+        self.coord_step_direction_combo.addItems(["向上", "向下", "向左", "向右", "自定义偏移", "移动到新点位"])
+        self.coord_step_direction_combo.setCurrentText(str(data.get("coord_step_direction", "向下")))
+        self.coord_step_direction_combo.currentTextChanged.connect(self.update_coord_step_ui)
+
+        self.coord_step_distance_edit = QLineEdit(str(data.get("coord_step_distance", "0")))
+        self.coord_step_distance_edit.setFixedWidth(70)
+        self.coord_step_dx_edit = QLineEdit(str(data.get("coord_step_dx", "0")))
+        self.coord_step_dx_edit.setFixedWidth(70)
+        self.coord_step_dy_edit = QLineEdit(str(data.get("coord_step_dy", "0")))
+        self.coord_step_dy_edit.setFixedWidth(70)
+        self.coord_step_point_edit = QLineEdit(str(data.get("coord_step_point", "")))
+        self.coord_step_point_edit.setPlaceholderText("例如 960,540")
+
+        self.coord_step_max_steps_edit = QLineEdit(str(data.get("coord_step_max_steps", "0")))
+        self.coord_step_max_steps_edit.setFixedWidth(70)
+        self.coord_step_max_steps_edit.setToolTip("普通方向：最多偏移多少次后不再移动，填 0 表示不限次数。移动到新点位：这里表示起点到目标点之间总共点击多少个点位，例如填 5 会点击起点、3 个中间点、目标点；填 0 表示直接从起点移动到目标点。")
+        self.coord_step_max_distance_edit = QLineEdit(str(data.get("coord_step_max_distance", "0")))
+        self.coord_step_max_distance_edit.setFixedWidth(70)
+        self.coord_step_max_distance_edit.setToolTip("累计偏移距离达到多少像素后不再移动；填 0 表示不限距离。")
+        self.coord_step_stop_chk = QCheckBox("达到移动上限后停止脚本")
+        self.coord_step_stop_chk.setChecked(config_bool(data.get("coord_step_stop", False)))
+        self.coord_step_reset_after_edit = QLineEdit(str(data.get("coord_step_reset_after", "0")))
+        self.coord_step_reset_after_edit.setFixedWidth(70)
+        self.coord_step_reset_after_edit.setToolTip("本坐标步进成功点击多少次后自动回到起点并重新开始移动；填 0 表示不自动重置。重置触发时优先于“达到移动上限后停止脚本”。左键双击按一次本步骤点击动作计数。")
+
+        coord_every_row = QWidget()
+        coord_every_layout = QHBoxLayout(coord_every_row)
+        coord_every_layout.setContentsMargins(0, 0, 0, 0)
+        coord_every_layout.addWidget(self.coord_step_every_edit)
+        coord_every_layout.addWidget(QLabel("次后移动"))
+        coord_every_layout.addStretch()
+
+        coord_direction_row = QWidget()
+        coord_direction_layout = QHBoxLayout(coord_direction_row)
+        coord_direction_layout.setContentsMargins(0, 0, 0, 0)
+        coord_direction_layout.addWidget(self.coord_step_direction_combo)
+        coord_direction_layout.addWidget(QLabel("距离:"))
+        coord_direction_layout.addWidget(self.coord_step_distance_edit)
+        coord_direction_layout.addWidget(QLabel("dx:"))
+        coord_direction_layout.addWidget(self.coord_step_dx_edit)
+        coord_direction_layout.addWidget(QLabel("dy:"))
+        coord_direction_layout.addWidget(self.coord_step_dy_edit)
+        coord_direction_layout.addStretch()
+
+        coord_limit_row = QWidget()
+        coord_limit_layout = QHBoxLayout(coord_limit_row)
+        coord_limit_layout.setContentsMargins(0, 0, 0, 0)
+        coord_limit_layout.addWidget(QLabel("次数:"))
+        coord_limit_layout.addWidget(self.coord_step_max_steps_edit)
+        coord_limit_layout.addWidget(QLabel("距离:"))
+        coord_limit_layout.addWidget(self.coord_step_max_distance_edit)
+        coord_limit_layout.addWidget(self.coord_step_stop_chk)
+        coord_limit_layout.addStretch()
+
+        coord_reset_row = QWidget()
+        coord_reset_layout = QHBoxLayout(coord_reset_row)
+        coord_reset_layout.setContentsMargins(0, 0, 0, 0)
+        coord_reset_layout.addWidget(self.coord_step_reset_after_edit)
+        coord_reset_layout.addWidget(QLabel("次点击后回到起点"))
+        coord_reset_layout.addStretch()
+
         self.fail_limit_edit = QLineEdit(str(data.get("fail_limit", "1")))
         self.fail_limit_edit.setFixedWidth(90)
         self.fail_limit_edit.setToolTip("例如填 1 表示失败一次就执行下一步；填 3 表示连续失败三次后才放弃本步。")
@@ -340,6 +415,12 @@ class TaskConfigDialog(QDialog):
         control_form.addRow("重复次数:", self.repeat_count_edit)
         control_form.addRow("同点点击上限:", self.point_limit_chk)
         control_form.addRow("上限次数:", self.point_limit_count_edit)
+        control_form.addRow("坐标步进:", self.coord_step_chk)
+        control_form.addRow("步进频率:", coord_every_row)
+        control_form.addRow("步进方向:", coord_direction_row)
+        control_form.addRow("目标点位:", self.coord_step_point_edit)
+        control_form.addRow("移动上限:", coord_limit_row)
+        control_form.addRow("重置循环:", coord_reset_row)
         control_form.addRow("连续失败次数:", self.fail_limit_edit)
         control_form.addRow("禁止跳过:", self.no_skip_wait_chk)
         control_form.addRow("成功后跳过:", self.success_skip_edit)
@@ -347,13 +428,14 @@ class TaskConfigDialog(QDialog):
         control_form.addRow("失败后跳过:", self.fail_skip_edit)
         control_form.addRow("失败后跳至:", self.fail_jump_edit)
 
-        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。开启禁止跳过后，失败分支会等到成功或超时后再处理。")
+        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。开启禁止跳过后，连续失败次数暂不生效，失败分支会等到成功或超时后再处理。移动到新点位时，“移动上限”表示起点到目标点之间的总点位数；“重置循环”可让本路径点击指定次数后回到起点。")
         control_note.setStyleSheet("color: #666;")
         control_note.setWordWrap(True)
         control_form.addRow("", control_note)
         layout.addWidget(control_box)
         self.update_repeat_ui()
         self.update_point_limit_ui()
+        self.update_coord_step_ui()
         
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
@@ -374,6 +456,22 @@ class TaskConfigDialog(QDialog):
 
     def update_point_limit_ui(self, _=None):
         self.point_limit_count_edit.setEnabled(self.point_limit_available and self.point_limit_chk.isChecked())
+
+    def update_coord_step_ui(self, _=None):
+        enabled = self.coordinate_step_available and self.coord_step_chk.isChecked()
+        direction = self.coord_step_direction_combo.currentText()
+        for widget in [
+            self.coord_step_every_edit, self.coord_step_direction_combo,
+            self.coord_step_distance_edit, self.coord_step_dx_edit, self.coord_step_dy_edit,
+            self.coord_step_point_edit, self.coord_step_max_steps_edit,
+            self.coord_step_max_distance_edit, self.coord_step_stop_chk,
+            self.coord_step_reset_after_edit
+        ]:
+            widget.setEnabled(enabled)
+        self.coord_step_distance_edit.setEnabled(enabled and direction in ["向上", "向下", "向左", "向右"])
+        self.coord_step_dx_edit.setEnabled(enabled and direction == "自定义偏移")
+        self.coord_step_dy_edit.setEnabled(enabled and direction == "自定义偏移")
+        self.coord_step_point_edit.setEnabled(enabled and direction == "移动到新点位")
 
     def save_dialog_geometry(self):
         try:
@@ -405,6 +503,17 @@ class TaskConfigDialog(QDialog):
             "repeat_count": self.repeat_count_edit.text(),
             "point_limit_en": self.point_limit_chk.isChecked() and self.point_limit_available,
             "point_limit_count": self.point_limit_count_edit.text(),
+            "coord_step_en": self.coord_step_chk.isChecked() and self.coordinate_step_available,
+            "coord_step_every": self.coord_step_every_edit.text(),
+            "coord_step_direction": self.coord_step_direction_combo.currentText(),
+            "coord_step_distance": self.coord_step_distance_edit.text(),
+            "coord_step_dx": self.coord_step_dx_edit.text(),
+            "coord_step_dy": self.coord_step_dy_edit.text(),
+            "coord_step_point": self.coord_step_point_edit.text(),
+            "coord_step_max_steps": self.coord_step_max_steps_edit.text(),
+            "coord_step_max_distance": self.coord_step_max_distance_edit.text(),
+            "coord_step_stop": self.coord_step_stop_chk.isChecked(),
+            "coord_step_reset_after": self.coord_step_reset_after_edit.text(),
             "fail_limit": self.fail_limit_edit.text(),
             "no_skip_wait": self.no_skip_wait_chk.isChecked(),
             "success_skip": self.success_skip_edit.text(),
@@ -497,20 +606,12 @@ class RegionWindow(QWidget):
         
         regions = self.valid_regions_for_paint()
         if regions:
-            mask_region = QRegion(self.rect())
-            clear_region = QRegion()
-            for rect in regions:
-                clear_region = clear_region.united(QRegion(rect))
-            overlay_region = mask_region.subtracted(clear_region)
-            
-            painter.setClipRegion(overlay_region)
             painter.fillRect(self.rect(), bg_color)
-            painter.setClipping(False)
             
             pen = QPen(QColor(0, 255, 0), 2)
             pen.setStyle(Qt.DashLine)
             painter.setPen(pen)
-            painter.setBrush(Qt.NoBrush)
+            painter.setBrush(QColor(0, 255, 0, 35))
             for idx, rect in enumerate(regions, 1):
                 painter.drawRect(rect)
                 real_w = int(rect.width() * self.scale_x)
@@ -1045,6 +1146,7 @@ class RPAEngine:
         self.img_cache = {} 
         self.scaled_templates_cache = {}
         self.point_click_counts = {}
+        self.coord_step_states = {}
 
         self.check_engine_status()
         self.set_high_priority()
@@ -1294,6 +1396,146 @@ class RPAEngine:
         except: pass
         return None
 
+    def parse_float_value(self, value, default=0.0):
+        try:
+            return float(str(value).strip())
+        except:
+            return default
+
+    def coord_step_options(self, task):
+        if not task or not self.as_bool(task.get("coord_step_en", False)):
+            return None
+        try:
+            every = max(1, int(float(task.get("coord_step_every", 1))))
+        except:
+            every = 1
+        return {
+            "every": every,
+            "direction": str(task.get("coord_step_direction", "向下")),
+            "distance": self.parse_float_value(task.get("coord_step_distance", 0), 0.0),
+            "dx": self.parse_float_value(task.get("coord_step_dx", 0), 0.0),
+            "dy": self.parse_float_value(task.get("coord_step_dy", 0), 0.0),
+            "point": str(task.get("coord_step_point", "")).strip(),
+            "max_steps": max(0, int(self.parse_float_value(task.get("coord_step_max_steps", 0), 0.0))),
+            "max_distance": max(0.0, self.parse_float_value(task.get("coord_step_max_distance", 0), 0.0)),
+            "stop": self.as_bool(task.get("coord_step_stop", False)),
+            "reset_after": max(0, int(self.parse_float_value(task.get("coord_step_reset_after", 0), 0.0)))
+        }
+
+    def _coord_step_key(self, step_info, base_x, base_y):
+        return (int(step_info.get("step", 0)) if step_info else 0, int(base_x), int(base_y))
+
+    def _coord_step_delta(self, options):
+        direction = options.get("direction", "向下")
+        distance = options.get("distance", 0.0)
+        if direction == "向上":
+            return 0.0, -distance
+        if direction == "向下":
+            return 0.0, distance
+        if direction == "向左":
+            return -distance, 0.0
+        if direction == "向右":
+            return distance, 0.0
+        if direction == "自定义偏移":
+            return options.get("dx", 0.0), options.get("dy", 0.0)
+        return 0.0, 0.0
+
+    def _get_coord_step_state(self, step_info, base_x, base_y):
+        key = self._coord_step_key(step_info, base_x, base_y)
+        if key not in self.coord_step_states:
+            self.coord_step_states[key] = {
+                "base_x": float(base_x), "base_y": float(base_y),
+                "x": float(base_x), "y": float(base_y),
+                "clicks_since_move": 0,
+                "clicks_since_reset": 0,
+                "offset_times": 0,
+                "movement_locked": False
+            }
+        return key, self.coord_step_states[key]
+
+    def _reset_coord_step_state(self, state):
+        state["x"] = float(state.get("base_x", state.get("x", 0.0)))
+        state["y"] = float(state.get("base_y", state.get("y", 0.0)))
+        state["clicks_since_move"] = 0
+        state["clicks_since_reset"] = 0
+        state["offset_times"] = 0
+        state["movement_locked"] = False
+
+    def _advance_coord_step_state(self, state, options, step_info):
+        reset_after = max(0, int(options.get("reset_after", 0)))
+        state["clicks_since_reset"] = state.get("clicks_since_reset", 0) + 1
+        if reset_after > 0 and state["clicks_since_reset"] >= reset_after:
+            self._reset_coord_step_state(state)
+            if self.log_level >= 2:
+                self.log(f"       坐标步进已成功点击 {reset_after} 次，已重置到起点（{int(state['x'])}，{int(state['y'])}）")
+            return "reset"
+
+        if state.get("movement_locked"):
+            return "locked_stop" if options.get("stop") else "locked"
+
+        state["clicks_since_move"] += 1
+        if state["clicks_since_move"] < options["every"]:
+            return "ok"
+
+        state["clicks_since_move"] = 0
+        if options["direction"] == "移动到新点位":
+            point = self.parse_coordinate(options.get("point", ""))
+            if not point:
+                if self.log_level >= 1:
+                    self.log("<font color='red'>    -> 坐标步进的新点位格式错误，已停止本步进移动。</font>")
+                state["movement_locked"] = True
+                return "locked_stop" if options.get("stop") else "locked"
+
+            total_points = options["max_steps"] if options["max_steps"] >= 2 else 2
+            max_offset_times = total_points - 1
+            if state["offset_times"] >= max_offset_times:
+                state["movement_locked"] = True
+                if self.log_level >= 1:
+                    self.log(f"<font color='orange'>    -> 坐标步进已到达目标点位，本路径共 {total_points} 个点，后续不再移动。</font>")
+                return "locked_stop" if options.get("stop") else "locked"
+
+            next_index = state["offset_times"] + 1
+            ratio = next_index / max_offset_times
+            next_x = state["base_x"] + (float(point[0]) - state["base_x"]) * ratio
+            next_y = state["base_y"] + (float(point[1]) - state["base_y"]) * ratio
+        else:
+            if options["max_steps"] > 0 and state["offset_times"] >= options["max_steps"]:
+                state["movement_locked"] = True
+                if self.log_level >= 1:
+                    self.log(f"<font color='orange'>    -> 坐标步进已达到最大偏移次数 {options['max_steps']}，后续不再移动。</font>")
+                return "locked_stop" if options.get("stop") else "locked"
+
+            dx, dy = self._coord_step_delta(options)
+            next_x, next_y = state["x"] + dx, state["y"] + dy
+
+        distance_from_base = ((next_x - state["base_x"]) ** 2 + (next_y - state["base_y"]) ** 2) ** 0.5
+        if options["max_distance"] > 0 and distance_from_base > options["max_distance"]:
+            state["movement_locked"] = True
+            if self.log_level >= 1:
+                self.log(f"<font color='orange'>    -> 坐标步进将超过最大偏移距离 {options['max_distance']:.1f}px，后续不再移动。</font>")
+            return "locked_stop" if options.get("stop") else "locked"
+
+        state["x"], state["y"] = next_x, next_y
+        state["offset_times"] += 1
+        return "moved"
+
+    def coord_step_log_message(self, x, y, state, options):
+        next_after = options["every"] - state["clicks_since_move"]
+        if next_after <= 0:
+            next_after = options["every"]
+        reset_after = max(0, int(options.get("reset_after", 0)))
+        reset_text = ""
+        if reset_after > 0:
+            reset_count = min(state.get("clicks_since_reset", 0) + 1, reset_after)
+            reset_text = f"，重置计数 {reset_count}/{reset_after}"
+
+        if options.get("direction") == "移动到新点位":
+            total_points = options["max_steps"] if options["max_steps"] >= 2 else 2
+            point_no = min(state["offset_times"] + 1, total_points)
+            return f"       当前点击位置（{int(x)}，{int(y)}），为第{state['offset_times']}次偏移（第{point_no}/{total_points}个点位），将在第{next_after}次后进行下次偏移{reset_text}"
+
+        return f"       当前点击位置（{int(x)}，{int(y)}），为第{state['offset_times']}次偏移，将在第{next_after}次后进行下次偏移{reset_text}"
+
     def perform_mouse_click(self, x, y, clickTimes, lOrR):
         pyautogui.moveTo(x, y, duration=self.move_duration)
         for _ in range(clickTimes):
@@ -1310,7 +1552,7 @@ class RPAEngine:
                 time.sleep(self.double_dodge_wait)
                 pyautogui.moveTo(self.dodge_x2, self.dodge_y2, duration=0)
 
-    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, point_limit_en=False, point_limit_count=0):
+    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, point_limit_en=False, point_limit_count=0, coord_step_config=None):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
         start_time = time.time()
         
@@ -1332,7 +1574,12 @@ class RPAEngine:
                 return "timeout"
 
             if coord:
-                locations = [(coord[0], coord[1], 1.0, 1.0)]
+                if coord_step_config:
+                    _step_key, coord_state = self._get_coord_step_state(step_info, coord[0], coord[1])
+                    locations = [(coord_state["x"], coord_state["y"], 1.0, 1.0)]
+                else:
+                    coord_state = None
+                    locations = [(coord[0], coord[1], 1.0, 1.0)]
                 find_time = 0.0
             elif need_all_matches:
                 find_start = time.time()
@@ -1371,7 +1618,16 @@ class RPAEngine:
                         x, y, scale, score = location_tuple
                         if use_all_targets and self.log_level >= 2:
                             self.log(f"       多目标 {target_idx}/{len(click_locations)} -> ({int(x)}, {int(y)}) 相似度 {score:.3f} 缩放 {scale:.2f}x")
+                        if coord_step_config and coord_state and self.log_level >= 2:
+                            self.log(self.coord_step_log_message(x, y, coord_state, coord_step_config))
                         self.perform_mouse_click(x, y, clickTimes, lOrR)
+                        if coord_step_config and coord_state:
+                            step_result = self._advance_coord_step_state(coord_state, coord_step_config, step_info)
+                            if step_result == "locked_stop":
+                                if self.log_level >= 0:
+                                    self.log("<font color='red'><b>    -> 坐标步进达到移动上限，已按设置停止脚本。</b></font>")
+                                self.stop()
+                                return "stopped"
                         if point_limit_en:
                             used_count = self._record_point_click(img_path, step_info, x, y)
                             if self.log_level >= 2:
@@ -1416,12 +1672,12 @@ class RPAEngine:
         if self.settlement_wait > 0: time.sleep(self.settlement_wait)
         return "success"
 
-    def execute_task_once(self, cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en=False, point_limit_count=0):
+    def execute_task_once(self, cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en=False, point_limit_count=0, coord_step_config=None):
         status = "success"
         try:
-            if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count)
-            elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count)
-            elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count)
+            if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
+            elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
+            elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
             elif cmd == 10.0: status = self.mouseDrag("left", val, step_info)
             elif cmd == 11.0: status = self.mouseDrag("right", val, step_info)
             elif cmd == 12.0:
@@ -1497,6 +1753,7 @@ class RPAEngine:
         self.img_cache = {}
         self.scaled_templates_cache = {}
         self.point_click_counts = {}
+        self.coord_step_states = {}
         self.load_and_precompute(tasks)
         
         global_start_time = time.time()
@@ -1545,6 +1802,9 @@ class RPAEngine:
                     point_limit_en = self.as_bool(task.get("point_limit_en", False)) and cmd in [1.0, 2.0, 3.0] and not self.parse_coordinate(val)
                     try: point_limit_count = max(0, int(float(task.get("point_limit_count", 0))))
                     except: point_limit_count = 0
+                    coord_step_config = None
+                    if cmd in [1.0, 2.0, 3.0] and self.parse_coordinate(val):
+                        coord_step_config = self.coord_step_options(task)
                     
                     if task.get("custom_en", False):
                         try: task_conf = float(task.get("custom_conf", self.confidence))
@@ -1606,7 +1866,7 @@ class RPAEngine:
                         needs_recognition_wait = cmd in [1.0, 2.0, 3.0, 8.0] and not self.parse_coordinate(val)
                         if (needs_recognition_wait or no_skip_wait) and not self.wait_recognition_interval():
                             return
-                        status = self.execute_task_once(cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count)
+                        status = self.execute_task_once(cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
 
                         step_duration = time.time() - step_start_time
                         if self.log_level >= 0:
@@ -1726,7 +1986,18 @@ class TaskRow(QFrame):
             "fail_jump": "0",
             "no_skip_wait": False,
             "point_limit_en": False,
-            "point_limit_count": "0"
+            "point_limit_count": "0",
+            "coord_step_en": False,
+            "coord_step_every": "1",
+            "coord_step_direction": "向下",
+            "coord_step_distance": "0",
+            "coord_step_dx": "0",
+            "coord_step_dy": "0",
+            "coord_step_point": "",
+            "coord_step_max_steps": "0",
+            "coord_step_max_distance": "0",
+            "coord_step_stop": False,
+            "coord_step_reset_after": "0"
         }
         
         self.setFrameShape(QFrame.StyledPanel)
@@ -1854,7 +2125,7 @@ class TaskRow(QFrame):
             self.config_dialog.activateWindow()
             return
 
-        dialog = TaskConfigDialog(None, self.custom_data, self.image_settings_available(), self.point_limit_available())
+        dialog = TaskConfigDialog(None, self.custom_data, self.image_settings_available(), self.point_limit_available(), self.coordinate_step_available())
         self.config_dialog = dialog
         dialog.accepted.connect(lambda d=dialog: self.apply_custom_config(d))
         dialog.finished.connect(lambda _result, d=dialog: self.clear_custom_config_dialog(d))
@@ -1882,6 +2153,12 @@ class TaskRow(QFrame):
         if text not in ["左键单击", "左键双击", "右键单击"]:
             return False
         return not self.is_direct_coordinate_value(text)
+
+    def coordinate_step_available(self):
+        text = self.type_combo.currentText()
+        if text not in ["左键单击", "左键双击", "右键单击"]:
+            return False
+        return self.is_direct_coordinate_value(text)
 
     def on_type_changed(self, text):
         tips = {
@@ -1938,7 +2215,18 @@ class TaskRow(QFrame):
             "fail_jump": data.get("fail_jump", "0"),
             "no_skip_wait": data.get("no_skip_wait", False),
             "point_limit_en": data.get("point_limit_en", False),
-            "point_limit_count": data.get("point_limit_count", "0")
+            "point_limit_count": data.get("point_limit_count", "0"),
+            "coord_step_en": data.get("coord_step_en", False),
+            "coord_step_every": data.get("coord_step_every", "1"),
+            "coord_step_direction": data.get("coord_step_direction", "向下"),
+            "coord_step_distance": data.get("coord_step_distance", "0"),
+            "coord_step_dx": data.get("coord_step_dx", "0"),
+            "coord_step_dy": data.get("coord_step_dy", "0"),
+            "coord_step_point": data.get("coord_step_point", ""),
+            "coord_step_max_steps": data.get("coord_step_max_steps", "0"),
+            "coord_step_max_distance": data.get("coord_step_max_distance", "0"),
+            "coord_step_stop": data.get("coord_step_stop", False),
+            "coord_step_reset_after": data.get("coord_step_reset_after", "0")
         }
         
         TYPES_REV = {
@@ -1976,6 +2264,8 @@ class TaskRow(QFrame):
         if self.is_direct_coordinate_value(self.type_combo.currentText()):
             data_dict["custom_en"] = False
             data_dict["point_limit_en"] = False
+        else:
+            data_dict["coord_step_en"] = False
         return data_dict
 
     def set_index(self, index):
@@ -2109,7 +2399,7 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("不高兴就喝水 RPA配置工具(浮夸改v1.3 精简版)")
+        self.setWindowTitle("RPA配置工具（浮夸改v1.4 精简版）")
         self.resize(800, 850)
         self.engine = RPAEngine()
         
@@ -2396,12 +2686,32 @@ class RPAWindow(QMainWindow):
         gl3_r3.addWidget(QLabel("步开始"))
         gl3_r3.addWidget(HelpBtn("【从第X步开始执行】\n默认 1。启动脚本后每轮循环都从这里开始；成功/失败跳至仍按列表中的实际步号计算。"))
         gl3_r3.addStretch()
+
+        gl3_r4 = QHBoxLayout()
+        self.low_power_ui_chk = QCheckBox("省电UI模式")
+        self.low_power_ui_chk.setChecked(True)
+        self.low_power_ui_chk.setToolTip("降低主窗口空闲刷新频率：快捷键轮询约 250ms，CPU显示约 3秒刷新一次。可减轻拖动窗口和空闲时的单核占用。")
+        self.low_power_ui_chk.stateChanged.connect(self.apply_ui_performance_mode)
+        gl3_r4.addWidget(self.low_power_ui_chk)
+        gl3_r4.addWidget(HelpBtn("【省电UI模式】\n只影响界面刷新和热键轮询频率，不改变脚本识别逻辑。\n如果你感觉热键响应慢，可以关闭。"))
+        gl3_r4.addStretch()
         
         gl3_main.addLayout(gl3_r1)
         gl3_main.addLayout(gl3_r2)
         gl3_main.addLayout(gl3_r3)
+        gl3_main.addLayout(gl3_r4)
         g3.set_content_layout(gl3_main)
         settings_content_layout.addWidget(g3)
+
+        links_row = QHBoxLayout()
+        links_row.addStretch()
+        bilibili_btn = QPushButton("作者B站主页")
+        bilibili_btn.clicked.connect(lambda: self.open_web_url("https://space.bilibili.com/95794432/dynamic"))
+        links_row.addWidget(bilibili_btn)
+        github_btn = QPushButton("GitHub下载页")
+        github_btn.clicked.connect(lambda: self.open_web_url("https://github.com/FUKUAHG13/waterRPA-FUKUA/releases"))
+        links_row.addWidget(github_btn)
+        settings_content_layout.addLayout(links_row)
         settings_content_layout.addStretch()
 
         # ================= 任务列表与日志分屏 =================
@@ -2470,11 +2780,11 @@ class RPAWindow(QMainWindow):
         # 初始化定时器与全局配置
         self.cpu_timer = QTimer()
         self.cpu_timer.timeout.connect(self.update_cpu_info)
-        self.cpu_timer.start(1000)
+        self.cpu_timer.start(self.current_cpu_interval())
         
         self.hotkey_timer = QTimer()
         self.hotkey_timer.timeout.connect(self.check_hotkey)
-        self.hotkey_timer.start(100)
+        self.hotkey_timer.start(self.current_hotkey_interval())
         
         self.init_profiles()
         self.bind_setting_logs()
@@ -2487,6 +2797,24 @@ class RPAWindow(QMainWindow):
             subprocess.Popen(["explorer.exe", config_dir])
         except Exception as e:
             QMessageBox.warning(self, "错误", f"无法打开配置目录: {e}")
+
+    def open_web_url(self, url):
+        try:
+            webbrowser.open(url, new=2)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"无法打开网页: {e}")
+
+    def current_hotkey_interval(self):
+        return 250 if getattr(self, "low_power_ui_chk", None) and self.low_power_ui_chk.isChecked() else 100
+
+    def current_cpu_interval(self):
+        return 3000 if getattr(self, "low_power_ui_chk", None) and self.low_power_ui_chk.isChecked() else 1000
+
+    def apply_ui_performance_mode(self, *_):
+        if getattr(self, "hotkey_timer", None):
+            self.hotkey_timer.setInterval(self.current_hotkey_interval())
+        if getattr(self, "cpu_timer", None):
+            self.cpu_timer.setInterval(self.current_cpu_interval())
 
     def show_settings_dialog(self):
         self.settings_dialog.show()
@@ -2547,7 +2875,7 @@ class RPAWindow(QMainWindow):
             "hotkey_start": "F9", "hotkey_stop": "F10", "log_level": 0,
             "tm_fs": True, "tr_fs": True, "key_fs": True,
             "log_f": False, "log_ui": True, "mini": False, "top": False,
-            "run_status_tip": True, "run_status_pos": "右上角", "start_step": "1",
+            "run_status_tip": True, "run_status_pos": "右上角", "start_step": "1", "low_power_ui": True,
             "loop_mode": "单次", "loop_val": "10",
             "scan_region": None, "scan_regions": [],
             "tasks": []
@@ -2570,7 +2898,7 @@ class RPAWindow(QMainWindow):
             "hotkey_start": self.hotkey_start_combo.currentText(), "hotkey_stop": self.hotkey_stop_combo.currentText(), "log_level": self.log_level_combo.currentIndex(),
             "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(),
             "log_f": self.log_file_chk.isChecked(), "log_ui": self.log_ui_chk.isChecked(), "mini": self.mini_chk.isChecked(), "top": self.top_chk.isChecked(),
-            "run_status_tip": self.run_status_chk.isChecked(), "run_status_pos": self.run_status_pos_combo.currentText(), "start_step": self.start_step_edit.text(),
+            "run_status_tip": self.run_status_chk.isChecked(), "run_status_pos": self.run_status_pos_combo.currentText(), "start_step": self.start_step_edit.text(), "low_power_ui": self.low_power_ui_chk.isChecked(),
             "loop_mode": self.loop_combo.currentText(), "loop_val": self.loop_val_edit.text(),
             "scan_region": self.engine.scan_region, "scan_regions": self.engine.scan_regions,
             "tasks": tasks
@@ -2617,6 +2945,8 @@ class RPAWindow(QMainWindow):
             self.run_status_chk.setChecked(bool(cfg.get("run_status_tip", True)))
             self.run_status_pos_combo.setCurrentText(str(cfg.get("run_status_pos", "右上角")))
             self.start_step_edit.setText(str(cfg.get("start_step", "1")))
+            self.low_power_ui_chk.setChecked(config_bool(cfg.get("low_power_ui", True)))
+            self.apply_ui_performance_mode()
             
             self.loop_combo.setCurrentText(str(cfg.get("loop_mode", "单次")))
             self.loop_val_edit.setText(str(cfg.get("loop_val", "10")))
@@ -2757,6 +3087,7 @@ class RPAWindow(QMainWindow):
         self.mini_chk.stateChanged.connect(lambda s: self.log_setting_change("启动时最小化", "开启" if s else "关闭"))
         self.run_status_chk.stateChanged.connect(lambda s: self.log_setting_change("运行状态提示", "开启" if s else "关闭"))
         self.timeout_stop_chk.stateChanged.connect(lambda s: self.log_setting_change("超时急停", "开启" if s else "关闭"))
+        self.low_power_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("省电UI模式", "开启" if s else "关闭"))
         
         self.hotkey_start_combo.currentTextChanged.connect(lambda t: self.log_setting_change("启动热键", t))
         self.hotkey_stop_combo.currentTextChanged.connect(lambda t: self.log_setting_change("停止热键", t))
@@ -2844,13 +3175,13 @@ class RPAWindow(QMainWindow):
         if start_pressed and not self.engine.is_running:
             self.start_task()
             self.hotkey_timer.stop()
-            QTimer.singleShot(500, lambda: self.hotkey_timer.start(100))
+            QTimer.singleShot(500, lambda: self.hotkey_timer.start(self.current_hotkey_interval()))
             return
             
         if stop_pressed and self.engine.is_running:
             self.stop_task()
             self.hotkey_timer.stop()
-            QTimer.singleShot(500, lambda: self.hotkey_timer.start(100))
+            QTimer.singleShot(500, lambda: self.hotkey_timer.start(self.current_hotkey_interval()))
             return
 
     def open_region_selector(self):
@@ -3146,6 +3477,16 @@ class RPAWindow(QMainWindow):
             repeat_count = str(task.get("repeat_count", "1")).strip()
             fail_limit = str(task.get("fail_limit", "1")).strip()
             point_limit_count = str(task.get("point_limit_count", "0")).strip()
+            coord_step_en = config_bool(task.get("coord_step_en", False))
+            coord_step_every = str(task.get("coord_step_every", "1")).strip()
+            coord_step_direction = str(task.get("coord_step_direction", "向下")).strip()
+            coord_step_distance = str(task.get("coord_step_distance", "0")).strip()
+            coord_step_dx = str(task.get("coord_step_dx", "0")).strip()
+            coord_step_dy = str(task.get("coord_step_dy", "0")).strip()
+            coord_step_point = str(task.get("coord_step_point", "")).strip()
+            coord_step_max_steps = str(task.get("coord_step_max_steps", "0")).strip()
+            coord_step_max_distance = str(task.get("coord_step_max_distance", "0")).strip()
+            coord_step_reset_after = str(task.get("coord_step_reset_after", "0")).strip()
             
             if success_skip and not success_skip.isdigit():
                 return f"第 {i+1} 步小齿轮里的'成功后跳过'必须是整数！\n填入内容: {success_skip}"
@@ -3161,6 +3502,33 @@ class RPAWindow(QMainWindow):
                 return f"第 {i+1} 步小齿轮里的'重复次数'必须是大于等于 1 的整数！\n填入内容: {repeat_count}"
             if point_limit_count and not point_limit_count.isdigit():
                 return f"第 {i+1} 步小齿轮里的'同点点击上限'必须是大于等于 0 的整数！\n填入内容: {point_limit_count}"
+            if coord_step_en and t in [1.0, 2.0, 3.0] and self.engine.parse_coordinate(v):
+                if not coord_step_every.isdigit() or int(coord_step_every) < 1:
+                    return f"第 {i+1} 步小齿轮里的'步进频率'必须是大于等于 1 的整数！\n填入内容: {coord_step_every}"
+                if coord_step_max_steps and (not coord_step_max_steps.isdigit() or int(coord_step_max_steps) < 0):
+                    return f"第 {i+1} 步小齿轮里的'最大偏移次数'必须是大于等于 0 的整数！\n填入内容: {coord_step_max_steps}"
+                if coord_step_reset_after and (not coord_step_reset_after.isdigit() or int(coord_step_reset_after) < 0):
+                    return f"第 {i+1} 步小齿轮里的'重置循环'必须是大于等于 0 的整数！\n填入内容: {coord_step_reset_after}"
+                try:
+                    if float(coord_step_max_distance or 0) < 0:
+                        return f"第 {i+1} 步小齿轮里的'最大偏移距离'不能小于 0！\n填入内容: {coord_step_max_distance}"
+                except:
+                    return f"第 {i+1} 步小齿轮里的'最大偏移距离'必须是数字！\n填入内容: {coord_step_max_distance}"
+                if coord_step_direction in ["向上", "向下", "向左", "向右"]:
+                    try: float(coord_step_distance)
+                    except: return f"第 {i+1} 步小齿轮里的'步进距离'必须是数字！\n填入内容: {coord_step_distance}"
+                elif coord_step_direction == "自定义偏移":
+                    try:
+                        float(coord_step_dx); float(coord_step_dy)
+                    except:
+                        return f"第 {i+1} 步小齿轮里的'自定义偏移 dx/dy'必须是数字！\n填入内容: dx={coord_step_dx}, dy={coord_step_dy}"
+                elif coord_step_direction == "移动到新点位":
+                    if not self.engine.parse_coordinate(coord_step_point):
+                        return f"第 {i+1} 步小齿轮里的'目标点位'必须是 x,y 坐标格式！\n填入内容: {coord_step_point}"
+                    if int(coord_step_max_steps or 0) == 1:
+                        return f"第 {i+1} 步小齿轮里的'移动上限'在移动到新点位时不能填 1。\n填 0 表示起点后直接移动到目标点；填 2 或更大表示从起点到目标点一共点击多少个点位。"
+                else:
+                    return f"第 {i+1} 步小齿轮里的'步进方向'无效！\n填入内容: {coord_step_direction}"
             
             if not v and t not in [9.0, 12.0, 13.0, 14.0]: 
                 return f"第 {i+1} 步参数不能为空！"
@@ -3180,6 +3548,85 @@ class RPAWindow(QMainWindow):
                 except: return f"第 {i+1} 步参数必须是纯数字！"
         return None
 
+    def analyze_loop_risks(self, tasks, cfg):
+        risks = []
+        if cfg.get("loop_mode") == "无限":
+            risks.append("全局循环模式为【无限】，脚本会在步骤列表执行完后重新开始，直到手动停止或急停。")
+
+        for i, task in enumerate(tasks):
+            step_no = i + 1
+            cmd_name = self.engine.get_cmd_name(task.get("type"))
+            repeat_mode = str(task.get("repeat_mode", "执行一次"))
+            if repeat_mode == "无限重复":
+                risks.append(f"第 {step_no} 步【{cmd_name}】设置为【无限重复】，会一直执行本步骤，直到手动停止或触发失败/超时分支。")
+            if config_bool(task.get("no_skip_wait", False)):
+                risks.append(f"第 {step_no} 步【{cmd_name}】启用【禁止跳过】，失败时会一直等待本步骤成功，直到满足目标、达到超时或触发急停。")
+
+            try:
+                reset_after = int(float(task.get("coord_step_reset_after", 0)))
+            except:
+                reset_after = 0
+            coord_step_en = config_bool(task.get("coord_step_en", False))
+            if coord_step_en and reset_after > 0 and self.engine.parse_coordinate(str(task.get("value", "")).strip()):
+                if repeat_mode == "无限重复" or cfg.get("loop_mode") == "无限":
+                    risks.append(f"第 {step_no} 步【{cmd_name}】启用【坐标步进重置循环】，每成功点击 {reset_after} 次会回到起点；当前又存在无限循环设置，可能会反复点击同一路径。")
+                else:
+                    risks.append(f"第 {step_no} 步【{cmd_name}】启用【坐标步进重置循环】，每成功点击 {reset_after} 次会回到起点，请确认这是预期的重复路径。")
+
+            for key, label in [("success_jump", "成功后跳至"), ("fail_jump", "失败后跳至")]:
+                try:
+                    jump_to = int(float(task.get(key, 0)))
+                except:
+                    jump_to = 0
+                if jump_to > 0 and jump_to <= step_no:
+                    if jump_to == step_no:
+                        risks.append(f"第 {step_no} 步【{cmd_name}】设置【{label}第 {jump_to} 步】，可能在本步骤原地循环。")
+                    else:
+                        risks.append(f"第 {step_no} 步【{cmd_name}】设置【{label}第 {jump_to} 步】，可能在第 {jump_to} 到第 {step_no} 步之间循环。")
+        return risks
+
+    def confirm_loop_risks(self, tasks, cfg):
+        risks = self.analyze_loop_risks(tasks, cfg)
+        if not risks:
+            return True
+
+        signature_src = json.dumps({
+            "loop_mode": cfg.get("loop_mode"),
+            "risks": risks,
+            "tasks": [
+                {
+                    "type": task.get("type"),
+                    "repeat_mode": task.get("repeat_mode"),
+                    "no_skip_wait": task.get("no_skip_wait"),
+                    "coord_step_en": task.get("coord_step_en"),
+                    "coord_step_reset_after": task.get("coord_step_reset_after"),
+                    "success_jump": task.get("success_jump"),
+                    "fail_jump": task.get("fail_jump")
+                } for task in tasks
+            ]
+        }, ensure_ascii=False, sort_keys=True)
+        signature = hashlib.sha256(signature_src.encode("utf-8")).hexdigest()
+        if self.settings.value("ack_loop_risk_signature", "") == signature:
+            return True
+
+        preview = "\n".join(risks[:8])
+        if len(risks) > 8:
+            preview += f"\n……另有 {len(risks) - 8} 条风险未显示。"
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("可能存在无限循环/等待")
+        msg.setText("检测到当前方案可能长时间停在某一步或循环执行。")
+        msg.setInformativeText(preview)
+        msg.setDetailedText("\n".join(risks))
+        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        msg.button(QMessageBox.Ok).setText("我知道了，继续运行")
+        msg.button(QMessageBox.Cancel).setText("取消运行")
+        if msg.exec() != QMessageBox.Ok:
+            return False
+        self.settings.setValue("ack_loop_risk_signature", signature)
+        return True
+
     def start_task(self):
         cfg = self.get_current_ui_config()
         tasks = cfg.get("tasks", [])
@@ -3188,6 +3635,9 @@ class RPAWindow(QMainWindow):
         err_msg = self.validate_tasks(tasks)
         if err_msg:
             QMessageBox.critical(self, "指令语法错误", err_msg)
+            return
+
+        if not self.confirm_loop_risks(tasks, cfg):
             return
             
         try:
