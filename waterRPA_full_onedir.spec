@@ -4,7 +4,7 @@
 a = Analysis(
     ['waterRPA.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('water_rpa_core.dll', '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],
@@ -21,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='waterRPA_full_v1_4',
+    name='waterRPA_full_v1_5',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,5 +40,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='waterRPA_full_v1_4',
+    name='waterRPA_full_v1_5',
 )

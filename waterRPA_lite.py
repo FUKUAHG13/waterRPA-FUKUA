@@ -37,6 +37,13 @@ import pyautogui
 SLIM_BUILD = True
 
 try:
+    import mss
+    HAS_MSS = True
+except ImportError:
+    mss = None
+    HAS_MSS = False
+
+try:
     import psutil
     HAS_PSUTIL = True
 except ImportError:
@@ -91,6 +98,18 @@ SWP_NOMOVE = 0x0002
 SWP_NOACTIVATE = 0x0010
 SWP_SHOWWINDOW = 0x0040
 SWP_NOOWNERZORDER = 0x0200
+WM_HOTKEY = 0x0312
+MOD_NOREPEAT = 0x4000
+HOTKEY_ID_START = 0x5741
+HOTKEY_ID_STOP = 0x5742
+
+try:
+    user32.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
+    user32.RegisterHotKey.restype = wintypes.BOOL
+    user32.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.UnregisterHotKey.restype = wintypes.BOOL
+except:
+    pass
 
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
@@ -137,6 +156,115 @@ def config_bool(value):
         return value.strip().lower() in ("1", "true", "yes", "on", "启用", "是")
     return bool(value)
 
+def parse_coordinate_text(val):
+    try:
+        val_str = str(val).strip()
+        if ',' in val_str:
+            parts = val_str.split(',')
+            if len(parts) == 2:
+                return int(parts[0].strip()), int(parts[1].strip())
+    except:
+        pass
+    return None
+
+def parse_float_text(value, default=0.0):
+    try:
+        return float(str(value).strip())
+    except:
+        return default
+
+def parse_coord_step_manual_points(value):
+    try:
+        if isinstance(value, dict):
+            raw = value
+        else:
+            text = str(value or "").strip()
+            if not text:
+                return {}
+            raw = json.loads(text)
+        points = {}
+        for key, coord in raw.items():
+            idx = int(key)
+            if idx <= 0:
+                continue
+            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                points[idx] = (float(coord[0]), float(coord[1]))
+        return points
+    except:
+        return {}
+
+def serialize_coord_step_manual_points(points):
+    normalized = {}
+    for idx, coord in (points or {}).items():
+        try:
+            idx = int(idx)
+            if idx <= 0:
+                continue
+            x, y = coord
+            normalized[str(idx)] = [int(round(float(x))), int(round(float(y)))]
+        except:
+            continue
+    return json.dumps(normalized, ensure_ascii=False, sort_keys=True)
+
+def coord_step_delta_values(direction, distance, dx, dy):
+    direction = str(direction)
+    if direction in ("\u5411\u4e0a", "鍚戜笂"):
+        return 0.0, -distance
+    if direction in ("\u5411\u4e0b", "鍚戜笅"):
+        return 0.0, distance
+    if direction in ("\u5411\u5de6", "鍚戝乏"):
+        return -distance, 0.0
+    if direction in ("\u5411\u53f3", "鍚戝彸"):
+        return distance, 0.0
+    if direction == "\u81ea\u5b9a\u4e49\u504f\u79fb" or direction.startswith("鑷"):
+        return dx, dy
+    return 0.0, 0.0
+
+def build_coord_step_positions(base_x, base_y, options, max_points=200):
+    base_x = float(base_x)
+    base_y = float(base_y)
+    direction = str(options.get("direction", "向下"))
+    max_steps = max(0, int(parse_float_text(options.get("max_steps", 0), 0.0)))
+    max_distance = max(0.0, parse_float_text(options.get("max_distance", 0), 0.0))
+    positions = [(base_x, base_y)]
+
+    if direction == "\u79fb\u52a8\u5230\u65b0\u70b9\u4f4d" or direction.startswith("绉诲姩"):
+        point = parse_coordinate_text(options.get("point", ""))
+        if not point:
+            return positions
+        target_x, target_y = float(point[0]), float(point[1])
+        total_points = max_steps if max_steps >= 2 else 2
+        for idx in range(1, min(total_points, max_points)):
+            ratio = idx / (total_points - 1)
+            x = base_x + (target_x - base_x) * ratio
+            y = base_y + (target_y - base_y) * ratio
+            distance_from_base = ((x - base_x) ** 2 + (y - base_y) ** 2) ** 0.5
+            if max_distance > 0 and distance_from_base > max_distance:
+                break
+            positions.append((x, y))
+        manual_points = parse_coord_step_manual_points(options.get("manual_points", options.get("coord_step_manual_points", {})))
+        for idx, manual_point in manual_points.items():
+            if 0 < idx < len(positions):
+                positions[idx] = manual_point
+        return positions
+
+    distance = parse_float_text(options.get("distance", 0), 0.0)
+    dx = parse_float_text(options.get("dx", 0), 0.0)
+    dy = parse_float_text(options.get("dy", 0), 0.0)
+    step_dx, step_dy = coord_step_delta_values(direction, distance, dx, dy)
+    if step_dx == 0 and step_dy == 0:
+        return positions
+
+    move_count = max_steps if max_steps > 0 else min(10, max_points - 1)
+    for idx in range(1, min(move_count + 1, max_points)):
+        x = base_x + step_dx * idx
+        y = base_y + step_dy * idx
+        distance_from_base = ((x - base_x) ** 2 + (y - base_y) ** 2) ** 0.5
+        if max_distance > 0 and distance_from_base > max_distance:
+            break
+        positions.append((x, y))
+    return positions
+
 def get_log_path():
     return os.path.join(get_base_dir(), "rpa_debug_log.txt")
 
@@ -164,6 +292,125 @@ log_thread.start()
 
 def write_log(msg, callback=None):
     LOG_QUEUE.put((msg, callback))
+
+class NativeRect(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("w", ctypes.c_int),
+        ("h", ctypes.c_int),
+    ]
+
+class NativeMatch(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_double),
+        ("y", ctypes.c_double),
+        ("scale", ctypes.c_double),
+        ("score", ctypes.c_double),
+        ("radius", ctypes.c_double),
+    ]
+
+class NativeVisionCore:
+    def __init__(self):
+        self.dll = None
+        self.available = False
+        self.load_error = ""
+        self.version = 0
+        self._load()
+
+    def _candidate_paths(self):
+        names = ["water_rpa_core.dll"]
+        bases = [get_base_dir()]
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            bases.append(sys._MEIPASS)
+        bases.append(os.path.join(get_base_dir(), "native_core"))
+        for base in bases:
+            for name in names:
+                yield os.path.join(base, name)
+
+    def _load(self):
+        last_error = ""
+        for dll_path in self._candidate_paths():
+            if not os.path.exists(dll_path):
+                continue
+            try:
+                dll = ctypes.CDLL(dll_path)
+                dll.wrpa_version.argtypes = []
+                dll.wrpa_version.restype = ctypes.c_int
+                dll.wrpa_find_template.argtypes = [
+                    ctypes.POINTER(ctypes.c_wchar),
+                    ctypes.POINTER(NativeRect),
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                    ctypes.c_double,
+                    ctypes.c_int,
+                    ctypes.POINTER(NativeMatch),
+                    ctypes.c_int,
+                    ctypes.POINTER(ctypes.c_int),
+                    ctypes.c_wchar_p,
+                    ctypes.c_int,
+                ]
+                dll.wrpa_find_template.restype = ctypes.c_int
+                self.version = int(dll.wrpa_version())
+                self.dll = dll
+                self.available = True
+                self.load_error = ""
+                return
+            except Exception as e:
+                last_error = f"{dll_path}: {e}"
+        self.load_error = last_error or "water_rpa_core.dll not found"
+
+    def find_template(self, image_path, regions, min_scale, max_scale, scale_step, use_gray, threshold, find_all=False, max_matches=512):
+        if not self.available or not self.dll:
+            return None
+        try:
+            clean_regions = []
+            for region in regions or []:
+                x, y, w, h = [int(float(v)) for v in region]
+                if w > 0 and h > 0:
+                    clean_regions.append((x, y, w, h))
+            rect_array = None
+            rect_ptr = None
+            if clean_regions:
+                rect_array = (NativeRect * len(clean_regions))()
+                for idx, (x, y, w, h) in enumerate(clean_regions):
+                    rect_array[idx] = NativeRect(x, y, w, h)
+                rect_ptr = rect_array
+
+            max_matches = max(1, min(int(max_matches), 4096))
+            out_array = (NativeMatch * max_matches)()
+            out_count = ctypes.c_int(0)
+            err_buf = ctypes.create_unicode_buffer(512)
+            rc = self.dll.wrpa_find_template(
+                os.path.abspath(str(image_path)),
+                rect_ptr,
+                len(clean_regions),
+                float(min_scale),
+                float(max_scale),
+                float(scale_step),
+                1 if use_gray else 0,
+                float(threshold),
+                1 if find_all else 0,
+                out_array,
+                max_matches,
+                ctypes.byref(out_count),
+                err_buf,
+                len(err_buf),
+            )
+            if rc < 0:
+                self.load_error = err_buf.value or f"native rc {rc}"
+                return None
+            result = []
+            for idx in range(max(0, min(out_count.value, max_matches))):
+                item = out_array[idx]
+                result.append((float(item.x), float(item.y), float(item.scale), float(item.score), float(item.radius)))
+            return result
+        except Exception as e:
+            self.load_error = str(e)
+            return None
 
 def global_exception_handler(exctype, value, tb):
     err_msg = "".join(traceback.format_exception(exctype, value, tb))
@@ -238,8 +485,129 @@ class HelpBtn(QPushButton):
     def show_tip(self):
         QToolTip.showText(QCursor.pos(), self.tip_text, self, QRect(), 5000)
 
+class ImageClickPointWidget(QWidget):
+    point_changed = Signal(float, float)
+
+    def __init__(self, pixmap, rx=0.5, ry=0.5, scale=2.0, selectable=True):
+        super().__init__()
+        self.pixmap = pixmap
+        self.rx = max(0.0, min(1.0, float(rx)))
+        self.ry = max(0.0, min(1.0, float(ry)))
+        self.selectable = selectable
+        self.display_scale = max(0.2, float(scale))
+        self.setFixedSize(
+            max(1, int(self.pixmap.width() * self.display_scale)),
+            max(1, int(self.pixmap.height() * self.display_scale))
+        )
+        self.setCursor(Qt.CrossCursor if selectable else Qt.ArrowCursor)
+
+    def set_point(self, rx, ry):
+        self.rx = max(0.0, min(1.0, float(rx)))
+        self.ry = max(0.0, min(1.0, float(ry)))
+        self.point_changed.emit(self.rx, self.ry)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        painter.drawPixmap(self.rect(), self.pixmap)
+
+        px = int(self.rx * self.width())
+        py = int(self.ry * self.height())
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(QColor(0, 0, 0, 210), 5, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(px - 18, py, px + 18, py)
+        painter.drawLine(px, py - 18, px, py + 18)
+        painter.setPen(QPen(QColor(255, 0, 0), 2, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(px - 18, py, px + 18, py)
+        painter.drawLine(px, py - 18, px, py + 18)
+        painter.setBrush(QColor(255, 255, 255, 230))
+        painter.drawEllipse(QPoint(px, py), 5, 5)
+
+    def mousePressEvent(self, event):
+        if self.selectable and event.button() == Qt.LeftButton:
+            pos = event.position() if hasattr(event, "position") else event.pos()
+            self.set_point(pos.x() / max(1, self.width()), pos.y() / max(1, self.height()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+class ImageClickPointDialog(QDialog):
+    def __init__(self, image_path, rx=0.5, ry=0.5, selectable=True, parent=None):
+        super().__init__(parent)
+        self.image_path = image_path
+        self.selectable = selectable
+        self.pixmap = QPixmap(image_path)
+        if self.pixmap.isNull():
+            raise ValueError("图片无法打开或格式不受支持")
+
+        self.setWindowTitle("选择图片内点击位置" if selectable else "预览图片内点击位置")
+        self.setMinimumSize(520, 420)
+        layout = QVBoxLayout(self)
+
+        hint = "左键点击放大图片中的目标位置；保存的是相对位置，缩放识别后仍会点同一处。"
+        if not selectable:
+            hint = "红色十字即当前将点击的图片内相对位置。"
+        hint_label = QLabel(hint)
+        hint_label.setStyleSheet("color: #555;")
+        hint_label.setWordWrap(True)
+        layout.addWidget(hint_label)
+
+        screen_rect = QApplication.primaryScreen().availableGeometry()
+        max_w = max(360, int(screen_rect.width() * 0.78))
+        max_h = max(280, int(screen_rect.height() * 0.68))
+        fit_scale = min(max_w / max(1, self.pixmap.width()), max_h / max(1, self.pixmap.height()))
+        longest = max(self.pixmap.width(), self.pixmap.height())
+        if longest <= 120:
+            preferred_scale = 6.0
+        elif longest <= 300:
+            preferred_scale = 4.0
+        elif longest <= 700:
+            preferred_scale = 2.0
+        else:
+            preferred_scale = 1.0
+        display_scale = max(0.2, min(preferred_scale, fit_scale))
+
+        self.image_widget = ImageClickPointWidget(self.pixmap, rx, ry, display_scale, selectable)
+        self.image_widget.point_changed.connect(self.update_info)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setWidget(self.image_widget)
+        layout.addWidget(scroll, 1)
+
+        self.info_label = QLabel()
+        self.info_label.setStyleSheet("color: #333; font-weight: bold;")
+        layout.addWidget(self.info_label)
+        self.update_info(self.image_widget.rx, self.image_widget.ry)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel) if selectable else QDialogButtonBox(QDialogButtonBox.Close)
+        if selectable:
+            buttons.button(QDialogButtonBox.Ok).setText("使用此位置")
+            buttons.accepted.connect(self.accept)
+            buttons.rejected.connect(self.reject)
+        else:
+            buttons.rejected.connect(self.reject)
+            buttons.button(QDialogButtonBox.Close).clicked.connect(self.reject)
+        layout.addWidget(buttons)
+
+        self.resize(
+            min(max_w + 40, self.image_widget.width() + 60),
+            min(max_h + 120, self.image_widget.height() + 150)
+        )
+
+    def update_info(self, rx, ry):
+        img_x = int(round(rx * self.pixmap.width()))
+        img_y = int(round(ry * self.pixmap.height()))
+        self.info_label.setText(
+            f"当前相对位置：X {rx:.3f} / Y {ry:.3f}；原图像素约 ({img_x}, {img_y})"
+        )
+
+    def selected_ratio(self):
+        return self.image_widget.rx, self.image_widget.ry
+
 class TaskConfigDialog(QDialog):
-    def __init__(self, parent, data, image_settings_available=True, point_limit_available=False, coordinate_step_available=False):
+    def __init__(self, parent, data, image_settings_available=True, point_limit_available=False, coordinate_step_available=False, base_coordinate=None, image_path="", image_click_point_available=False, base_coordinate_changed=None):
         super().__init__(None)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowFlag(Qt.Window, True)
@@ -247,12 +615,21 @@ class TaskConfigDialog(QDialog):
         self.image_settings_available = image_settings_available and not SLIM_BUILD
         self.point_limit_available = point_limit_available
         self.coordinate_step_available = coordinate_step_available
+        self.base_coordinate = base_coordinate
+        self.image_path = image_path
+        self.image_click_point_available = image_click_point_available
+        self.base_coordinate_changed = base_coordinate_changed
+        self.coord_step_picker = None
+        self.coord_step_preview = None
+        self.coord_step_manual_points = parse_coord_step_manual_points(data.get("coord_step_manual_points", "{}"))
+        self.coord_step_max_steps_initial = str(data.get("coord_step_max_steps", "0"))
+        self.coord_step_clearing_due_to_count = False
         self.dialog_settings = QSettings(os.path.join(get_base_dir(), "config.ini"), QSettings.IniFormat)
         self.setWindowTitle("步骤设置")
-        self.setMinimumSize(560, 560)
+        self.setMinimumSize(720, 560)
         layout = QVBoxLayout(self)
         
-        note = QLabel("精简版仅支持原图原尺寸精确识别；已去掉相似度、缩放和灰度识别。")
+        note = QLabel("图片识别设置仅对图片点击/图片悬停生效；直接输入坐标时会自动忽略这些参数。")
         note.setStyleSheet("color: #666;")
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -261,8 +638,6 @@ class TaskConfigDialog(QDialog):
         self.enable_chk.setChecked(data.get("custom_en", False))
         self.enable_chk.setStyleSheet("font-weight: bold; color: #E91E63;")
         layout.addWidget(self.enable_chk)
-        if SLIM_BUILD:
-            self.enable_chk.hide()
         
         self.form_widget = QWidget()
         form = QFormLayout(self.form_widget)
@@ -282,14 +657,13 @@ class TaskConfigDialog(QDialog):
         form.addRow("色彩模式:", self.gray_chk)
         
         layout.addWidget(self.form_widget)
-        if SLIM_BUILD:
-            self.form_widget.hide()
         self.enable_chk.setEnabled(self.image_settings_available)
         self.form_widget.setEnabled(self.image_settings_available and self.enable_chk.isChecked())
         self.enable_chk.toggled.connect(self.update_image_settings_enabled)
 
         if not self.image_settings_available:
-            disabled_note = QLabel("精简版已移除独立识别参数；图片步骤会按原图原尺寸精确匹配。")
+            disabled_text = "精简版已移除独立识别参数；图片步骤会按原图原尺寸精确匹配。" if SLIM_BUILD else "当前步骤不是图片识别模式，以上图片识别参数不会参与执行。"
+            disabled_note = QLabel(disabled_text)
             disabled_note.setStyleSheet("color: #999;")
             disabled_note.setWordWrap(True)
             layout.addWidget(disabled_note)
@@ -305,6 +679,26 @@ class TaskConfigDialog(QDialog):
         self.repeat_count_edit = QLineEdit(str(data.get("repeat_count", "1")))
         self.repeat_count_edit.setFixedWidth(90)
 
+        self.step_loop_start_edit = QLineEdit(str(data.get("step_loop_start", "1")))
+        self.step_loop_start_edit.setFixedWidth(70)
+        self.step_loop_start_edit.setToolTip("本步骤从第几次脚本循环开始执行；默认 1 表示从第一轮就生效。")
+        self.step_loop_end_edit = QLineEdit(str(data.get("step_loop_end", "0")))
+        self.step_loop_end_edit.setFixedWidth(70)
+        self.step_loop_end_edit.setToolTip("本步骤执行到第几次脚本循环后不再执行；填 0 表示不限。填 5 表示第 1-5 轮执行，第 6 轮开始跳过。")
+
+        step_loop_row = QWidget()
+        step_loop_layout = QHBoxLayout(step_loop_row)
+        step_loop_layout.setContentsMargins(0, 0, 0, 0)
+        step_loop_layout.addWidget(QLabel("从第"))
+        step_loop_layout.addWidget(self.step_loop_start_edit)
+        step_loop_layout.addWidget(QLabel("次循环开始"))
+        step_loop_layout.addSpacing(10)
+        step_loop_layout.addWidget(QLabel("到第"))
+        step_loop_layout.addWidget(self.step_loop_end_edit)
+        step_loop_layout.addWidget(QLabel("次循环后停止"))
+        step_loop_layout.addWidget(HelpBtn("【本步骤循环范围】\n控制当前步骤在脚本第几轮循环中生效。\n起始循环默认 1；停止循环填 0 表示不限。\n被范围跳过时不会触发成功/失败跳转，只会继续执行下一步。"))
+        step_loop_layout.addStretch()
+
         self.point_limit_chk = QCheckBox("图片点击同一点位达到上限后忽略此点位")
         self.point_limit_chk.setChecked(config_bool(data.get("point_limit_en", False)) and self.point_limit_available)
         self.point_limit_chk.setEnabled(self.point_limit_available)
@@ -314,6 +708,34 @@ class TaskConfigDialog(QDialog):
         self.point_limit_count_edit = QLineEdit(str(data.get("point_limit_count", "0")))
         self.point_limit_count_edit.setFixedWidth(90)
         self.point_limit_count_edit.setToolTip("填 0 表示不限制；例如填 1 表示同一个识别点位只点击一次。")
+
+        self.image_click_point_chk = QCheckBox("命中图片后点击图片内指定位置")
+        self.image_click_point_chk.setMinimumWidth(245)
+        self.image_click_point_chk.setChecked(config_bool(data.get("image_click_point_en", False)) and self.image_click_point_available)
+        self.image_click_point_chk.setEnabled(self.image_click_point_available)
+        self.image_click_point_chk.setToolTip("仅对图片路径的左键单击、左键双击、右键单击生效；直接坐标点击会自动忽略。")
+        self.image_click_point_chk.toggled.connect(self.update_image_click_point_ui)
+        self.image_click_point_rx = str(data.get("image_click_point_rx", "0.5"))
+        self.image_click_point_ry = str(data.get("image_click_point_ry", "0.5"))
+
+        image_point_row = QWidget()
+        image_point_layout = QHBoxLayout(image_point_row)
+        image_point_layout.setContentsMargins(0, 0, 0, 0)
+        image_point_layout.addWidget(self.image_click_point_chk)
+        self.image_click_point_select_btn = QPushButton("选择")
+        self.image_click_point_select_btn.setFixedWidth(54)
+        self.image_click_point_select_btn.setToolTip("打开放大的模板图片，左键点击要实际点击的位置。")
+        self.image_click_point_select_btn.clicked.connect(self.select_image_click_point)
+        image_point_layout.addWidget(self.image_click_point_select_btn)
+        self.image_click_point_preview_btn = QPushButton("预览")
+        self.image_click_point_preview_btn.setFixedWidth(54)
+        self.image_click_point_preview_btn.setToolTip("预览当前保存的图片内点击位置。")
+        self.image_click_point_preview_btn.clicked.connect(self.preview_image_click_point)
+        image_point_layout.addWidget(self.image_click_point_preview_btn)
+        self.image_click_point_info = QLabel("")
+        self.image_click_point_info.setStyleSheet("color: #666;")
+        image_point_layout.addWidget(self.image_click_point_info)
+        image_point_layout.addStretch()
 
         self.coord_step_chk = QCheckBox("坐标点击启用步进偏移")
         self.coord_step_chk.setChecked(config_bool(data.get("coord_step_en", False)) and self.coordinate_step_available)
@@ -342,6 +764,7 @@ class TaskConfigDialog(QDialog):
         self.coord_step_max_steps_edit = QLineEdit(str(data.get("coord_step_max_steps", "0")))
         self.coord_step_max_steps_edit.setFixedWidth(70)
         self.coord_step_max_steps_edit.setToolTip("普通方向：最多偏移多少次后不再移动，填 0 表示不限次数。移动到新点位：这里表示起点到目标点之间总共点击多少个点位，例如填 5 会点击起点、3 个中间点、目标点；填 0 表示直接从起点移动到目标点。")
+        self.coord_step_max_steps_edit.textChanged.connect(self.on_coord_step_count_changed)
         self.coord_step_max_distance_edit = QLineEdit(str(data.get("coord_step_max_distance", "0")))
         self.coord_step_max_distance_edit.setFixedWidth(70)
         self.coord_step_max_distance_edit.setToolTip("累计偏移距离达到多少像素后不再移动；填 0 表示不限距离。")
@@ -370,6 +793,21 @@ class TaskConfigDialog(QDialog):
         coord_direction_layout.addWidget(self.coord_step_dy_edit)
         coord_direction_layout.addStretch()
 
+        coord_point_row = QWidget()
+        coord_point_layout = QHBoxLayout(coord_point_row)
+        coord_point_layout.setContentsMargins(0, 0, 0, 0)
+        coord_point_layout.addWidget(self.coord_step_point_edit)
+        self.coord_step_pick_btn = QPushButton("取")
+        self.coord_step_pick_btn.setFixedWidth(34)
+        self.coord_step_pick_btn.setToolTip("点击后直接进入取点状态，左键选取目标点位，右键取消。")
+        self.coord_step_pick_btn.clicked.connect(self.start_coord_step_point_pick)
+        coord_point_layout.addWidget(self.coord_step_pick_btn)
+        self.coord_step_preview_btn = QPushButton("预览")
+        self.coord_step_preview_btn.setFixedWidth(54)
+        self.coord_step_preview_btn.setToolTip("在屏幕上临时显示本步骤会点击的点位；预览不会执行点击。")
+        self.coord_step_preview_btn.clicked.connect(self.show_coord_step_preview)
+        coord_point_layout.addWidget(self.coord_step_preview_btn)
+
         coord_limit_row = QWidget()
         coord_limit_layout = QHBoxLayout(coord_limit_row)
         coord_limit_layout.setContentsMargins(0, 0, 0, 0)
@@ -387,9 +825,21 @@ class TaskConfigDialog(QDialog):
         coord_reset_layout.addWidget(QLabel("次点击后回到起点"))
         coord_reset_layout.addStretch()
 
+        coord_manual_row = QWidget()
+        coord_manual_layout = QHBoxLayout(coord_manual_row)
+        coord_manual_layout.setContentsMargins(0, 0, 0, 0)
+        self.coord_step_manual_info = QLabel("")
+        self.coord_step_manual_info.setStyleSheet("color: #7B1FA2; font-weight: bold;")
+        coord_manual_layout.addWidget(self.coord_step_manual_info)
+        self.coord_step_clear_manual_btn = QPushButton("清除手动修正点")
+        self.coord_step_clear_manual_btn.setToolTip("清除本步骤预览中拖动中间点产生的手动修正坐标。")
+        self.coord_step_clear_manual_btn.clicked.connect(self.clear_coord_step_manual_points)
+        coord_manual_layout.addWidget(self.coord_step_clear_manual_btn)
+        coord_manual_layout.addStretch()
+
         self.fail_limit_edit = QLineEdit(str(data.get("fail_limit", "1")))
         self.fail_limit_edit.setFixedWidth(90)
-        self.fail_limit_edit.setToolTip("例如填 1 表示失败一次就执行下一步；填 3 表示连续失败三次后才放弃本步。")
+        self.fail_limit_edit.setToolTip("例如填 1 表示失败一次就执行下一步；填 3 表示连续失败三次后才放弃本步。优先级低于“禁止跳过”：开启禁止跳过时，会先一直等待本步骤成功或超时。")
 
         self.no_skip_wait_chk = QCheckBox("禁止跳过：失败后一直等待本步骤")
         self.no_skip_wait_chk.setChecked(config_bool(data.get("no_skip_wait", False)))
@@ -413,14 +863,17 @@ class TaskConfigDialog(QDialog):
 
         control_form.addRow("本步骤重复:", self.repeat_combo)
         control_form.addRow("重复次数:", self.repeat_count_edit)
+        control_form.addRow("循环范围:", step_loop_row)
         control_form.addRow("同点点击上限:", self.point_limit_chk)
         control_form.addRow("上限次数:", self.point_limit_count_edit)
+        control_form.addRow("图片内点击点:", image_point_row)
         control_form.addRow("坐标步进:", self.coord_step_chk)
         control_form.addRow("步进频率:", coord_every_row)
         control_form.addRow("步进方向:", coord_direction_row)
-        control_form.addRow("目标点位:", self.coord_step_point_edit)
+        control_form.addRow("目标点位:", coord_point_row)
         control_form.addRow("移动上限:", coord_limit_row)
         control_form.addRow("重置循环:", coord_reset_row)
+        control_form.addRow("手动修正:", coord_manual_row)
         control_form.addRow("连续失败次数:", self.fail_limit_edit)
         control_form.addRow("禁止跳过:", self.no_skip_wait_chk)
         control_form.addRow("成功后跳过:", self.success_skip_edit)
@@ -428,14 +881,16 @@ class TaskConfigDialog(QDialog):
         control_form.addRow("失败后跳过:", self.fail_skip_edit)
         control_form.addRow("失败后跳至:", self.fail_jump_edit)
 
-        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。开启禁止跳过后，连续失败次数暂不生效，失败分支会等到成功或超时后再处理。移动到新点位时，“移动上限”表示起点到目标点之间的总点位数；“重置循环”可让本路径点击指定次数后回到起点。")
+        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。循环范围只控制本步骤在哪些脚本循环轮次生效，被范围跳过不会触发成功/失败分支。开启禁止跳过后，连续失败次数暂不生效，失败分支会等到成功或超时后再处理。移动到新点位时，“移动上限”表示起点到目标点之间的总点位数；“重置循环”可让本路径点击指定次数后回到起点。")
         control_note.setStyleSheet("color: #666;")
         control_note.setWordWrap(True)
         control_form.addRow("", control_note)
         layout.addWidget(control_box)
         self.update_repeat_ui()
         self.update_point_limit_ui()
+        self.update_image_click_point_ui()
         self.update_coord_step_ui()
+        self.update_coord_step_manual_ui()
         
         btn_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btn_box.accepted.connect(self.accept)
@@ -446,7 +901,7 @@ class TaskConfigDialog(QDialog):
         if geometry:
             self.restoreGeometry(geometry)
         else:
-            self.resize(620, 650)
+            self.resize(780, 650)
 
     def update_image_settings_enabled(self):
         self.form_widget.setEnabled(self.image_settings_available and self.enable_chk.isChecked())
@@ -457,6 +912,57 @@ class TaskConfigDialog(QDialog):
     def update_point_limit_ui(self, _=None):
         self.point_limit_count_edit.setEnabled(self.point_limit_available and self.point_limit_chk.isChecked())
 
+    def update_image_click_point_ui(self, _=None):
+        enabled = self.image_click_point_available
+        checked = enabled and self.image_click_point_chk.isChecked()
+        self.image_click_point_chk.setEnabled(enabled)
+        self.image_click_point_select_btn.setEnabled(enabled)
+        self.image_click_point_preview_btn.setEnabled(checked)
+        if not enabled:
+            self.image_click_point_info.setText("请先选择图片路径")
+            return
+        rx = parse_float_text(self.image_click_point_rx, 0.5)
+        ry = parse_float_text(self.image_click_point_ry, 0.5)
+        self.image_click_point_info.setText(f"X {rx:.3f}, Y {ry:.3f}" if checked else "默认点击图片中心")
+
+    def select_image_click_point(self):
+        if not self.image_click_point_available:
+            QMessageBox.information(self, "无法选择", "当前步骤不是可用的图片点击步骤。请先选择左键/右键点击指令，并填写存在的图片路径。")
+            return
+        try:
+            dialog = ImageClickPointDialog(
+                self.image_path,
+                parse_float_text(self.image_click_point_rx, 0.5),
+                parse_float_text(self.image_click_point_ry, 0.5),
+                selectable=True,
+                parent=self
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "图片打开失败", str(e))
+            return
+        if dialog.exec() == QDialog.Accepted:
+            rx, ry = dialog.selected_ratio()
+            self.image_click_point_rx = f"{rx:.6f}"
+            self.image_click_point_ry = f"{ry:.6f}"
+            self.image_click_point_chk.setChecked(True)
+            self.update_image_click_point_ui()
+
+    def preview_image_click_point(self):
+        if not (self.image_click_point_available and self.image_click_point_chk.isChecked()):
+            return
+        try:
+            dialog = ImageClickPointDialog(
+                self.image_path,
+                parse_float_text(self.image_click_point_rx, 0.5),
+                parse_float_text(self.image_click_point_ry, 0.5),
+                selectable=False,
+                parent=self
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "图片打开失败", str(e))
+            return
+        dialog.exec()
+
     def update_coord_step_ui(self, _=None):
         enabled = self.coordinate_step_available and self.coord_step_chk.isChecked()
         direction = self.coord_step_direction_combo.currentText()
@@ -465,13 +971,153 @@ class TaskConfigDialog(QDialog):
             self.coord_step_distance_edit, self.coord_step_dx_edit, self.coord_step_dy_edit,
             self.coord_step_point_edit, self.coord_step_max_steps_edit,
             self.coord_step_max_distance_edit, self.coord_step_stop_chk,
-            self.coord_step_reset_after_edit
+            self.coord_step_reset_after_edit, self.coord_step_pick_btn, self.coord_step_preview_btn
         ]:
             widget.setEnabled(enabled)
         self.coord_step_distance_edit.setEnabled(enabled and direction in ["向上", "向下", "向左", "向右"])
         self.coord_step_dx_edit.setEnabled(enabled and direction == "自定义偏移")
         self.coord_step_dy_edit.setEnabled(enabled and direction == "自定义偏移")
         self.coord_step_point_edit.setEnabled(enabled and direction == "移动到新点位")
+        self.coord_step_pick_btn.setEnabled(enabled and direction == "移动到新点位")
+        self.coord_step_preview_btn.setEnabled(enabled and self.base_coordinate is not None)
+        self.update_coord_step_manual_ui()
+
+    def coord_step_manual_active(self):
+        return self.coord_step_direction_combo.currentText() == "移动到新点位"
+
+    def manual_point_indices(self):
+        return sorted(int(idx) for idx in self.coord_step_manual_points.keys())
+
+    def update_coord_step_manual_ui(self):
+        active = self.coordinate_step_available and self.coord_step_chk.isChecked() and self.coord_step_manual_active()
+        count = len(self.coord_step_manual_points) if active else 0
+        if count:
+            nums = "、".join(str(idx + 1) for idx in self.manual_point_indices())
+            self.coord_step_manual_info.setText(f"已手动修正 {count} 个点：第 {nums} 个")
+        else:
+            self.coord_step_manual_info.setText("无手动修正点")
+        self.coord_step_clear_manual_btn.setEnabled(active and count > 0)
+
+    def current_coord_step_points(self):
+        if self.base_coordinate is None:
+            return []
+        return build_coord_step_positions(self.base_coordinate[0], self.base_coordinate[1], self.current_coord_step_options())
+
+    def refresh_coord_step_preview_points(self):
+        preview = getattr(self, "coord_step_preview", None)
+        if not preview:
+            return
+        points = self.current_coord_step_points()
+        if points:
+            preview.set_points(points)
+            if hasattr(preview, "set_marked_indices"):
+                preview.set_marked_indices(self.manual_point_indices())
+
+    def clear_coord_step_manual_points(self, silent=False):
+        if not self.coord_step_manual_points:
+            self.update_coord_step_manual_ui()
+            return
+        self.coord_step_manual_points = {}
+        self.update_coord_step_manual_ui()
+        self.refresh_coord_step_preview_points()
+        if not silent:
+            QToolTip.showText(QCursor.pos(), "已清除本步骤的手动修正点", self, QRect(), 1800)
+
+    def on_coord_step_count_changed(self, text):
+        if self.coord_step_clearing_due_to_count:
+            return
+        if self.coord_step_manual_points and str(text) != str(self.coord_step_max_steps_initial):
+            self.coord_step_clearing_due_to_count = True
+            try:
+                self.clear_coord_step_manual_points(silent=True)
+                self.coord_step_max_steps_initial = str(text)
+            finally:
+                self.coord_step_clearing_due_to_count = False
+
+    def current_coord_step_options(self):
+        return {
+            "every": max(1, int(parse_float_text(self.coord_step_every_edit.text(), 1))),
+            "direction": self.coord_step_direction_combo.currentText(),
+            "distance": parse_float_text(self.coord_step_distance_edit.text(), 0.0),
+            "dx": parse_float_text(self.coord_step_dx_edit.text(), 0.0),
+            "dy": parse_float_text(self.coord_step_dy_edit.text(), 0.0),
+            "point": self.coord_step_point_edit.text().strip(),
+            "max_steps": max(0, int(parse_float_text(self.coord_step_max_steps_edit.text(), 0.0))),
+            "max_distance": max(0.0, parse_float_text(self.coord_step_max_distance_edit.text(), 0.0)),
+            "reset_after": max(0, int(parse_float_text(self.coord_step_reset_after_edit.text(), 0.0))),
+            "manual_points": dict(self.coord_step_manual_points) if self.coord_step_manual_active() else {}
+        }
+
+    def start_coord_step_point_pick(self):
+        self.coord_step_picker = CoordinatePickerUI("point", self.on_coord_step_point_picked)
+
+    def on_coord_step_point_picked(self, value):
+        self.coord_step_point_edit.setText(value)
+        self.update_coord_step_ui()
+
+    def on_coord_step_preview_point_moved(self, index, x, y):
+        direction = self.coord_step_direction_combo.currentText()
+        point_count = len(getattr(self.coord_step_preview, "points", []))
+        if index < 0:
+            index = point_count + index
+        if index == 0:
+            value = f"{int(x)},{int(y)}"
+            self.base_coordinate = (int(x), int(y))
+            if self.base_coordinate_changed:
+                self.base_coordinate_changed(value)
+        elif direction == "移动到新点位" and point_count > 1 and index == point_count - 1:
+            self.coord_step_point_edit.setText(f"{int(x)},{int(y)}")
+        elif direction == "移动到新点位" and 0 < index < max(0, point_count - 1):
+            self.coord_step_manual_points[int(index)] = (int(x), int(y))
+            self.update_coord_step_manual_ui()
+            if getattr(self, "coord_step_preview", None) and hasattr(self.coord_step_preview, "set_marked_indices"):
+                self.coord_step_preview.set_marked_indices(self.manual_point_indices())
+        options = self.current_coord_step_options()
+        if self.base_coordinate is None:
+            return None
+        return build_coord_step_positions(self.base_coordinate[0], self.base_coordinate[1], options)
+
+    def show_coord_step_preview(self):
+        if self.base_coordinate is None:
+            QMessageBox.information(self, "无法预览", "当前步骤没有可用的起点坐标。请先在步骤参数里直接填写起点坐标，例如 100,200。")
+            return
+        options = self.current_coord_step_options()
+        if options["direction"] == "移动到新点位" and not parse_coordinate_text(options.get("point", "")):
+            QMessageBox.information(self, "无法预览", "请先填写或选取目标点位，例如 960,540。")
+            return
+        points = build_coord_step_positions(self.base_coordinate[0], self.base_coordinate[1], options)
+        if len(points) <= 1:
+            QMessageBox.information(self, "无法预览", "当前步进设置不会产生新的点击点位，请检查步进方向、距离或目标点位。")
+            return
+        self.close_coord_step_preview()
+        editable = [0]
+        drag_text = "可拖动起点，右键或空白处关闭。"
+        if options["direction"] == "移动到新点位":
+            editable = list(range(len(points)))
+            drag_text = "拖起点/终点会重算整条路径；拖中间点只修正该点并显示星号。右键或空白处关闭。"
+        self.coord_step_preview = CoordinateStepPreviewOverlay(
+            points,
+            options,
+            title=f"坐标步进预览：{len(points)} 个可轮到的点位",
+            detail_text=f"实际执行每次只点当前点；再次执行本步骤才移动到下一个点。{drag_text}",
+            editable_indices=editable,
+            point_moved_callback=self.on_coord_step_preview_point_moved,
+            auto_close_ms=0,
+            marked_indices=self.manual_point_indices()
+        )
+        self.coord_step_preview.destroyed.connect(self.clear_coord_step_preview)
+
+    def clear_coord_step_preview(self, *_):
+        self.coord_step_preview = None
+
+    def close_coord_step_preview(self):
+        preview = getattr(self, "coord_step_preview", None)
+        if preview:
+            try:
+                preview.close()
+            except RuntimeError:
+                pass
+            self.coord_step_preview = None
 
     def save_dialog_geometry(self):
         try:
@@ -488,6 +1134,9 @@ class TaskConfigDialog(QDialog):
         super().reject()
 
     def closeEvent(self, event):
+        if getattr(self, "coord_step_picker", None):
+            self.coord_step_picker.close()
+        self.close_coord_step_preview()
         self.save_dialog_geometry()
         super().closeEvent(event)
 
@@ -501,8 +1150,13 @@ class TaskConfigDialog(QDialog):
             "custom_gray": self.gray_chk.isChecked(),
             "repeat_mode": self.repeat_combo.currentText(),
             "repeat_count": self.repeat_count_edit.text(),
+            "step_loop_start": self.step_loop_start_edit.text(),
+            "step_loop_end": self.step_loop_end_edit.text(),
             "point_limit_en": self.point_limit_chk.isChecked() and self.point_limit_available,
             "point_limit_count": self.point_limit_count_edit.text(),
+            "image_click_point_en": self.image_click_point_chk.isChecked() and self.image_click_point_available,
+            "image_click_point_rx": self.image_click_point_rx,
+            "image_click_point_ry": self.image_click_point_ry,
             "coord_step_en": self.coord_step_chk.isChecked() and self.coordinate_step_available,
             "coord_step_every": self.coord_step_every_edit.text(),
             "coord_step_direction": self.coord_step_direction_combo.currentText(),
@@ -514,6 +1168,7 @@ class TaskConfigDialog(QDialog):
             "coord_step_max_distance": self.coord_step_max_distance_edit.text(),
             "coord_step_stop": self.coord_step_stop_chk.isChecked(),
             "coord_step_reset_after": self.coord_step_reset_after_edit.text(),
+            "coord_step_manual_points": serialize_coord_step_manual_points(self.coord_step_manual_points if (self.coord_step_chk.isChecked() and self.coordinate_step_available and self.coord_step_manual_active()) else {}),
             "fail_limit": self.fail_limit_edit.text(),
             "no_skip_wait": self.no_skip_wait_chk.isChecked(),
             "success_skip": self.success_skip_edit.text(),
@@ -630,7 +1285,7 @@ class RegionWindow(QWidget):
             painter.setPen(QColor(255, 255, 255))
             painter.setFont(QFont("Arial", 16, QFont.Bold))
             if self.multi:
-                hint = f"左键拖拽添加多个区域 | 右键完成 | 缩放比: {self.scale_x:.2f}"
+                hint = f"左键拖拽添加多个小区域 | 右键完成 | 区域相近时建议框成一个大矩形 | 缩放比: {self.scale_x:.2f}"
             else:
                 hint = f"请框选区域 | 右键取消 | 缩放比: {self.scale_x:.2f}"
             fm = painter.fontMetrics()
@@ -980,6 +1635,198 @@ class CoordinatePickerUI(QWidget):
             self.pick_thread.wait(500)
         event.accept()
 
+class CoordinateStepPreviewOverlay(QWidget):
+    def __init__(self, points, options=None, title=None, auto_close_ms=6000, draw_lines=True, editable_indices=None, point_moved_callback=None, detail_text=None, close_on_left_blank=True, marked_indices=None):
+        super().__init__()
+        self.points = [(float(x), float(y)) for x, y in points]
+        self.options = options or {}
+        self.custom_title = title
+        self.detail_text = detail_text
+        self.auto_close_ms = auto_close_ms
+        self.draw_lines = draw_lines
+        self.editable_indices = set(editable_indices or [])
+        self.marked_indices = set(marked_indices or [])
+        self.point_moved_callback = point_moved_callback
+        self.close_on_left_blank = close_on_left_blank
+        self.drag_index = None
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setCursor(Qt.PointingHandCursor)
+
+        virtual_rect = QApplication.primaryScreen().virtualGeometry()
+        self.setGeometry(virtual_rect)
+        phys_w, phys_h = pyautogui.size()
+        self.scale_x = phys_w / max(1, virtual_rect.width())
+        self.scale_y = phys_h / max(1, virtual_rect.height())
+
+        if self.auto_close_ms > 0:
+            QTimer.singleShot(self.auto_close_ms, self.close)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+        self.setFocus()
+
+    def to_screen_point(self, x, y):
+        return QPoint(int(x / self.scale_x), int(y / self.scale_y))
+
+    def set_points(self, points):
+        self.points = [(float(x), float(y)) for x, y in points]
+        self.update()
+
+    def set_marked_indices(self, marked_indices):
+        self.marked_indices = set(marked_indices or [])
+        self.update()
+
+    def from_screen_point(self, point):
+        return int(round(point.x() * self.scale_x)), int(round(point.y() * self.scale_y))
+
+    def nearest_editable_index(self, pos):
+        if not self.editable_indices or not self.points:
+            return None
+        screen_points = [self.to_screen_point(x, y) for x, y in self.points]
+        best_idx = None
+        best_dist = 18 * 18
+        for idx in self.editable_indices:
+            if idx < 0:
+                idx = len(screen_points) + idx
+            if idx < 0 or idx >= len(screen_points):
+                continue
+            point = screen_points[idx]
+            dist = (point.x() - pos.x()) ** 2 + (point.y() - pos.y()) ** 2
+            if dist <= best_dist:
+                best_dist = dist
+                best_idx = idx
+        return best_idx
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        if not self.points:
+            return
+
+        if self.custom_title:
+            title = self.custom_title
+        else:
+            title = f"坐标步进预览：{len(self.points)} 个可轮到的点位"
+            if self.auto_close_ms > 0:
+                title += f"，{int(self.auto_close_ms / 1000)} 秒后自动关闭"
+        if not self.custom_title and self.options.get("direction") == "移动到新点位":
+            max_steps = max(0, int(parse_float_text(self.options.get("max_steps", 0), 0)))
+            if max_steps >= 2:
+                title += f"；移动上限 {max_steps} = 起点到目标点共 {max_steps} 个点"
+            else:
+                title += "；移动上限 0 = 起点后直接移动到目标点"
+        painter.setFont(QFont("Arial", 13, QFont.Bold))
+        fm = painter.fontMetrics()
+        max_title_width = max(360, self.width() - 40)
+        title = fm.elidedText(title, Qt.ElideRight, max_title_width - 24)
+        detail = self.detail_text or ""
+        min_title_width = 520 if detail else 0
+        title_rect = QRect(20, 24, min(max(fm.horizontalAdvance(title) + 24, min_title_width), max_title_width), 58 if detail else 34)
+        title_rect.moveLeft(max(20, (self.width() - title_rect.width()) // 2))
+        painter.fillRect(title_rect, QColor(0, 0, 0, 190))
+        painter.setPen(QColor(255, 255, 255))
+        if detail:
+            painter.drawText(QRect(title_rect.x() + 12, title_rect.y() + 5, title_rect.width() - 24, 24), Qt.AlignCenter, title)
+            painter.setFont(QFont("Arial", 9))
+            dfm = painter.fontMetrics()
+            draw_detail = dfm.elidedText(detail, Qt.ElideRight, title_rect.width() - 24)
+            painter.drawText(QRect(title_rect.x() + 12, title_rect.y() + 30, title_rect.width() - 24, 22), Qt.AlignCenter, draw_detail)
+        else:
+            painter.drawText(title_rect, Qt.AlignCenter, title)
+
+        screen_points = [self.to_screen_point(x, y) for x, y in self.points]
+        if self.draw_lines and len(screen_points) > 1:
+            painter.setPen(QPen(QColor(0, 188, 212, 220), 3, Qt.SolidLine, Qt.RoundCap))
+            for idx in range(len(screen_points) - 1):
+                painter.drawLine(screen_points[idx], screen_points[idx + 1])
+
+        painter.setFont(QFont("Arial", 10, QFont.Bold))
+        normalized_editable = set()
+        for edit_idx in self.editable_indices:
+            normalized_editable.add(len(screen_points) + edit_idx if edit_idx < 0 else edit_idx)
+        normalized_marked = set()
+        for mark_idx in self.marked_indices:
+            normalized_marked.add(len(screen_points) + mark_idx if mark_idx < 0 else mark_idx)
+        for idx, point in enumerate(screen_points, 1):
+            zero_idx = idx - 1
+            if zero_idx in normalized_marked:
+                fill = QColor(156, 39, 176, 240)
+            elif idx == 1:
+                fill = QColor(76, 175, 80, 235)
+            elif idx == len(screen_points):
+                fill = QColor(244, 67, 54, 235)
+            else:
+                fill = QColor(255, 193, 7, 235)
+
+            radius = 13 if zero_idx in normalized_marked else (12 if zero_idx in normalized_editable else 9)
+            painter.setBrush(fill)
+            painter.setPen(QPen(QColor(255, 255, 255), 3 if zero_idx in normalized_editable or zero_idx in normalized_marked else 2))
+            painter.drawEllipse(point, radius, radius)
+
+            label = f"{idx}*" if zero_idx in normalized_marked else str(idx)
+            label_rect = QRect(point.x() + 12, point.y() - 22, 48, 22)
+            painter.fillRect(label_rect, QColor(0, 0, 0, 175))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(label_rect, Qt.AlignCenter, label)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.RightButton:
+            self.close()
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton:
+            idx = self.nearest_editable_index(event.position().toPoint())
+            if idx is not None:
+                self.drag_index = idx
+                self.setCursor(Qt.SizeAllCursor)
+                event.accept()
+                return
+            if self.close_on_left_blank:
+                self.close()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        pos = event.position().toPoint()
+        if self.drag_index is not None:
+            x, y = self.from_screen_point(pos)
+            self.points[self.drag_index] = (x, y)
+            if self.point_moved_callback:
+                updated_points = self.point_moved_callback(self.drag_index, int(round(x)), int(round(y)))
+                if updated_points:
+                    self.set_points(updated_points)
+            self.update()
+            event.accept()
+            return
+        self.setCursor(Qt.SizeAllCursor if self.nearest_editable_index(pos) is not None else Qt.PointingHandCursor)
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.drag_index is not None:
+            idx = self.drag_index
+            self.drag_index = None
+            self.setCursor(Qt.PointingHandCursor)
+            x, y = self.points[idx]
+            if self.point_moved_callback:
+                updated_points = self.point_moved_callback(idx, int(round(x)), int(round(y)))
+                if updated_points:
+                    self.set_points(updated_points)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape:
+            self.close()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
 class RunningStatusOverlay(QWidget):
     def __init__(self):
         super().__init__()
@@ -1051,6 +1898,51 @@ class RunningStatusOverlay(QWidget):
     def stop_overlay(self):
         self.timer.stop()
         self.hide()
+
+class ClickPointOverlay(QWidget):
+    def __init__(self, x, y, text="", duration_ms=650):
+        super().__init__()
+        self.x = float(x)
+        self.y = float(y)
+        self.text = str(text or "")
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        virtual_rect = QApplication.primaryScreen().virtualGeometry()
+        self.setGeometry(virtual_rect)
+        phys_w, phys_h = pyautogui.size()
+        self.scale_x = phys_w / max(1, virtual_rect.width())
+        self.scale_y = phys_h / max(1, virtual_rect.height())
+        QTimer.singleShot(max(200, int(duration_ms)), self.close)
+        self.show()
+        self.raise_()
+
+    def to_screen_point(self):
+        return QPoint(int(self.x / self.scale_x), int(self.y / self.scale_y))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        point = self.to_screen_point()
+
+        painter.setPen(QPen(QColor(255, 255, 255, 235), 4))
+        painter.setBrush(QColor(33, 150, 243, 90))
+        painter.drawEllipse(point, 18, 18)
+        painter.setPen(QPen(QColor(244, 67, 54, 245), 3, Qt.SolidLine, Qt.RoundCap))
+        painter.drawLine(point.x() - 24, point.y(), point.x() + 24, point.y())
+        painter.drawLine(point.x(), point.y() - 24, point.x(), point.y() + 24)
+
+        if self.text:
+            painter.setFont(QFont("Arial", 10, QFont.Bold))
+            label = painter.fontMetrics().elidedText(self.text, Qt.ElideRight, 160)
+            rect = QRect(point.x() + 24, point.y() - 14, min(170, painter.fontMetrics().horizontalAdvance(label) + 20), 28)
+            if rect.right() > self.width() - 8:
+                rect.moveRight(point.x() - 24)
+            painter.fillRect(rect, QColor(0, 0, 0, 180))
+            painter.setPen(QColor(255, 255, 255))
+            painter.drawText(rect, Qt.AlignCenter, label)
 
 class FailsafeWatchdog(threading.Thread):
     def __init__(self, engine):
@@ -1129,8 +2021,14 @@ class RPAEngine:
         self.timeout_val = 0.0
         self.timeout_stop = False
         self.detect_delay = 0.0
+        self.adaptive_backoff = True
+        self.show_click_indicator = True
+        self.use_native_core = False if SLIM_BUILD else True
+        self.use_fast_screenshot = True
         self.playback_speed = 1.0
         self.start_step_index = 0
+        self.loop_start_round = 1
+        self.loop_end_round = 0
         self.multi_target_mode = "最佳一个"
         self.multi_target_order = "从上到下"
         self.loop_mode = "单次"
@@ -1142,13 +2040,22 @@ class RPAEngine:
         
         self.callback_msg = None
         self.callback_status = None
+        self.callback_click_indicator = None
         self.opencv_available = False 
+        self.native_core = None if SLIM_BUILD else NativeVisionCore()
+        self.native_core_logged = False
         self.img_cache = {} 
         self.scaled_templates_cache = {}
+        self.scale_options_cache = {}
         self.point_click_counts = {}
         self.coord_step_states = {}
+        self.miss_streaks = {}
+        self.last_target_positions = {}
+        self._mss_instance = None
 
         self.check_engine_status()
+        if not SLIM_BUILD:
+            self._log_native_core_status()
         self.set_high_priority()
 
     def set_high_priority(self):
@@ -1159,8 +2066,28 @@ class RPAEngine:
         except: pass
 
     def check_engine_status(self):
-        self.opencv_available = False
-        write_log("精简版引擎就绪：已移除 OpenCV/NumPy，仅支持原图原尺寸精确匹配。")
+        if SLIM_BUILD:
+            self.opencv_available = False
+            write_log("精简版引擎就绪：已移除 OpenCV/NumPy/DLL 原生识别，仅支持原图原尺寸精确匹配。")
+            return
+        try:
+            import cv2
+            import numpy
+            img = numpy.zeros((10, 10, 3), dtype=numpy.uint8)
+            cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            self.opencv_available = True
+            write_log("OpenCV/NumPy 引擎就绪。")
+        except:
+            self.opencv_available = False
+            write_log("OpenCV 引擎不可用。")
+
+    def _log_native_core_status(self):
+        if SLIM_BUILD:
+            return
+        if self.native_core.available:
+            write_log(f"Native vision core ready (v{self.native_core.version}).")
+        else:
+            write_log(f"Native vision core unavailable, fallback enabled: {self.native_core.load_error}")
 
     def stop(self):
         self.stop_requested = True
@@ -1180,18 +2107,121 @@ class RPAEngine:
                 })
             except: pass
 
+    def report_click_indicator(self, x, y, text=""):
+        if not self.show_click_indicator or not self.callback_click_indicator:
+            return
+        try:
+            self.callback_click_indicator({
+                "x": int(round(float(x))),
+                "y": int(round(float(y))),
+                "text": str(text or "")
+            })
+        except:
+            pass
+
+    def positive_int_value(self, value, default=1):
+        try:
+            return max(1, int(float(value)))
+        except:
+            return default
+
+    def non_negative_int_value(self, value, default=0):
+        try:
+            return max(0, int(float(value)))
+        except:
+            return default
+
     def check_stop_flag(self):
         return self.stop_requested
 
-    def wait_recognition_interval(self):
-        if self.detect_delay <= 0:
+    def wait_recognition_interval(self, extra_delay=0.0):
+        wait_time = max(0.0, self.detect_delay + max(0.0, extra_delay))
+        if wait_time <= 0:
             return True
-        end_time = time.time() + self.detect_delay
+        end_time = time.time() + wait_time
         while time.time() < end_time:
             if self.check_stop_flag():
                 return False
             time.sleep(min(0.05, max(0.0, end_time - time.time())))
         return True
+
+    def wait_step_interval(self):
+        wait_time = max(0.0, float(self.settlement_wait or 0.0))
+        if wait_time <= 0:
+            return True
+        end_time = time.time() + wait_time
+        while time.time() < end_time:
+            if self.check_stop_flag():
+                return False
+            time.sleep(min(0.05, max(0.0, end_time - time.time())))
+        return True
+
+    def is_wait_command(self, cmd):
+        try:
+            return float(cmd) == 5.0
+        except:
+            return False
+
+    def task_active_in_loop(self, task, loop_count):
+        if not task:
+            return False
+        step_loop_start = self.positive_int_value(task.get("step_loop_start", 1), 1)
+        step_loop_end = self.non_negative_int_value(task.get("step_loop_end", 0), 0)
+        if loop_count < step_loop_start:
+            return False
+        if step_loop_end > 0 and loop_count > step_loop_end:
+            return False
+        return True
+
+    def next_interval_task(self, tasks, next_idx, loop_count):
+        for look_idx in range(max(0, int(next_idx)), len(tasks)):
+            task = tasks[look_idx]
+            if self.task_active_in_loop(task, loop_count):
+                return task
+
+        next_loop = loop_count + 1
+        if self.loop_mode == "单次":
+            return None
+        if self.loop_end_round > 0 and next_loop > self.loop_end_round:
+            return None
+        start_idx = min(max(int(getattr(self, "start_step_index", 0)), 0), max(len(tasks) - 1, 0))
+        for look_idx in range(start_idx, len(tasks)):
+            task = tasks[look_idx]
+            if self.task_active_in_loop(task, next_loop):
+                return task
+        return None
+
+    def should_wait_step_interval(self, tasks, current_cmd, next_idx, loop_count):
+        if max(0.0, float(self.settlement_wait or 0.0)) <= 0:
+            return False
+        if self.is_wait_command(current_cmd):
+            return False
+        next_task = self.next_interval_task(tasks, next_idx, loop_count)
+        if not next_task:
+            return False
+        if self.is_wait_command(next_task.get("type")):
+            return False
+        return True
+
+    def recognition_key(self, img_path, step_info):
+        step = step_info.get("step", 0) if step_info else 0
+        return (step, os.path.abspath(str(img_path)))
+
+    def record_recognition_miss(self, img_path, step_info):
+        key = self.recognition_key(img_path, step_info)
+        self.miss_streaks[key] = self.miss_streaks.get(key, 0) + 1
+        return self.miss_streaks[key]
+
+    def reset_recognition_miss(self, img_path, step_info):
+        self.miss_streaks.pop(self.recognition_key(img_path, step_info), None)
+
+    def adaptive_extra_delay(self, img_path, step_info):
+        if not self.adaptive_backoff:
+            return 0.0
+        miss_count = self.miss_streaks.get(self.recognition_key(img_path, step_info), 0)
+        if miss_count < 3:
+            return 0.0
+        return min(0.8, 0.05 * (miss_count - 2))
 
     def as_bool(self, value):
         if isinstance(value, str):
@@ -1209,9 +2239,212 @@ class RPAEngine:
                 continue
         return result
 
-    def load_and_precompute(self, tasks):
+    def capture_screenshot(self, region=None):
+        if self.use_fast_screenshot and HAS_MSS:
+            try:
+                if self._mss_instance is None:
+                    self._mss_instance = mss.mss()
+                if region:
+                    x, y, w, h = [int(v) for v in region]
+                    monitor = {"left": x, "top": y, "width": w, "height": h}
+                    offset_x, offset_y = x, y
+                else:
+                    monitor = self._mss_instance.monitors[0]
+                    offset_x, offset_y = int(monitor.get("left", 0)), int(monitor.get("top", 0))
+                shot = self._mss_instance.grab(monitor)
+                return Image.frombytes("RGB", shot.size, shot.rgb), offset_x, offset_y
+            except Exception as e:
+                if self.log_level >= 2:
+                    self.log(f"<font color='orange'>    [截图] mss快速截图失败，已回退到pyautogui: {e}</font>")
+
+        screenshot_pil = pyautogui.screenshot(region=region)
+        offset_x = region[0] if region else 0
+        offset_y = region[1] if region else 0
+        return screenshot_pil, offset_x, offset_y
+
+    def region_bounding_rect(self, regions):
+        left = min(r[0] for r in regions)
+        top = min(r[1] for r in regions)
+        right = max(r[0] + r[2] for r in regions)
+        bottom = max(r[1] + r[3] for r in regions)
+        return (left, top, right - left, bottom - top)
+
+    def screen_bounds(self):
+        if HAS_MSS:
+            try:
+                if self._mss_instance is None:
+                    self._mss_instance = mss.mss()
+                monitor = self._mss_instance.monitors[0]
+                return (int(monitor.get("left", 0)), int(monitor.get("top", 0)), int(monitor["width"]), int(monitor["height"]))
+            except:
+                pass
+        w, h = pyautogui.size()
+        return (0, 0, int(w), int(h))
+
+    def clip_region_to_bounds(self, region, bounds):
+        x, y, w, h = [int(v) for v in region]
+        bx, by, bw, bh = [int(v) for v in bounds]
+        left = max(x, bx)
+        top = max(y, by)
+        right = min(x + w, bx + bw)
+        bottom = min(y + h, by + bh)
+        if right <= left or bottom <= top:
+            return None
+        return (left, top, right - left, bottom - top)
+
+    def should_batch_regions(self, regions):
+        if len(regions) < 2:
+            return False
+        total_area = sum(w * h for _x, _y, w, h in regions)
+        bx, by, bw, bh = self.region_bounding_rect(regions)
+        bbox_area = bw * bh
+        return bbox_area <= max(total_area * 3, total_area + 50000)
+
+    def iter_search_screenshots(self):
+        active_regions = self.normalized_regions(getattr(self, "scan_regions", []))
+        if not active_regions:
+            yield self.capture_screenshot(self.scan_region)
+            return
+
+        if self.should_batch_regions(active_regions):
+            bbox = self.region_bounding_rect(active_regions)
+            try:
+                screenshot_pil, offset_x, offset_y = self.capture_screenshot(bbox)
+                for x, y, w, h in active_regions:
+                    crop_box = (x - offset_x, y - offset_y, x - offset_x + w, y - offset_y + h)
+                    yield screenshot_pil.crop(crop_box), x, y
+                return
+            except Exception as e:
+                if self.log_level >= 2:
+                    self.log(f"<font color='orange'>    [截图] 多区域合并截图失败，改为逐区域截图: {e}</font>")
+
+        for region in active_regions:
+            if self.check_stop_flag():
+                return
+            yield self.capture_screenshot(region)
+
+    def target_position_key(self, img_path, cache_key, task_conf, use_gray):
+        return (os.path.abspath(str(img_path)), str(cache_key), float(task_conf), bool(use_gray))
+
+    def template_dimensions(self, img_path):
         try:
-            write_log("正在预加载精简版图片资源...")
+            if img_path not in self.img_cache and os.path.exists(img_path):
+                img = Image.open(img_path)
+                img.load()
+                self.img_cache[img_path] = img
+            img = self.img_cache.get(img_path)
+            if img:
+                return img.size
+        except:
+            pass
+        return (80, 80)
+
+    def image_click_point_options(self, task):
+        if not task or not self.as_bool(task.get("image_click_point_en", False)):
+            return None
+        rx = max(0.0, min(1.0, self.parse_float_value(task.get("image_click_point_rx", 0.5), 0.5)))
+        ry = max(0.0, min(1.0, self.parse_float_value(task.get("image_click_point_ry", 0.5), 0.5)))
+        return {"rx": rx, "ry": ry}
+
+    def adjusted_image_click_point(self, img_path, location_tuple, image_click_config):
+        x, y, scale, score = location_tuple
+        if not image_click_config:
+            return x, y
+        tpl_w, tpl_h = self.template_dimensions(img_path)
+        matched_w = tpl_w * max(0.01, float(scale))
+        matched_h = tpl_h * max(0.01, float(scale))
+        rx = image_click_config.get("rx", 0.5)
+        ry = image_click_config.get("ry", 0.5)
+        click_x = x + (rx - 0.5) * matched_w
+        click_y = y + (ry - 0.5) * matched_h
+        return click_x, click_y
+
+    def quick_search_region(self, img_path, cache_key, task_conf, use_gray):
+        if self.normalized_regions(getattr(self, "scan_regions", [])):
+            return None
+        key = self.target_position_key(img_path, cache_key, task_conf, use_gray)
+        last = self.last_target_positions.get(key)
+        if not last:
+            return None
+
+        tpl_w, tpl_h = self.template_dimensions(img_path)
+        radius = max(120, int(max(tpl_w, tpl_h) * 3))
+        x = int(last[0] - radius)
+        y = int(last[1] - radius)
+        region = (x, y, radius * 2, radius * 2)
+        bounds = self.scan_region if self.scan_region else self.screen_bounds()
+        return self.clip_region_to_bounds(region, bounds)
+
+    def scale_options_for(self, cache_key):
+        if SLIM_BUILD:
+            return (1.0, 1.0, 0.05)
+        return self.scale_options_cache.get(str(cache_key), (self.min_scale, self.max_scale, self.scale_step))
+
+    def native_search_regions(self, quick_region=None):
+        if quick_region:
+            return [quick_region]
+        active_regions = self.normalized_regions(getattr(self, "scan_regions", []))
+        if active_regions:
+            return active_regions
+        if self.scan_region:
+            return [self.scan_region]
+        return []
+
+    def native_find_targets(self, img_path, cache_key, task_conf, use_gray, find_all=False, quick_region=None):
+        if SLIM_BUILD:
+            return None
+        if not self.use_native_core:
+            return None
+        if not getattr(self, "native_core", None) or not self.native_core.available:
+            return None
+        path = str(img_path)
+        if not path or ',' in path or not os.path.exists(path):
+            return None
+        if self.check_stop_flag():
+            return None
+
+        s_min, s_max, s_step = self.scale_options_for(cache_key)
+        max_matches = 1024 if find_all else 1
+        matches = self.native_core.find_template(
+            path,
+            self.native_search_regions(quick_region),
+            s_min,
+            s_max,
+            s_step,
+            use_gray,
+            task_conf,
+            find_all=find_all,
+            max_matches=max_matches,
+        )
+        if matches is None:
+            if self.log_level >= 2 and self.native_core.load_error:
+                self.log(f"<font color='gray'>    [native] fallback: {self.native_core.load_error}</font>")
+            return None
+        return [(x, y, scale, score) for x, y, scale, score, _radius in matches]
+
+    def load_and_precompute(self, tasks):
+        if SLIM_BUILD:
+            try:
+                write_log("正在预加载精简版图片资源...")
+                for task in tasks:
+                    path = str(task.get("value", ""))
+                    if not path or not os.path.exists(path) or ',' in path:
+                        continue
+                    if task.get("type") not in [1.0, 2.0, 3.0, 8.0]:
+                        continue
+                    img = Image.open(path)
+                    img.load()
+                    self.img_cache[path] = img
+                    task['cache_key'] = path
+                write_log("精简版图片资源预加载完成。")
+            except Exception as e:
+                write_log(f"精简版图片预加载失败: {e}")
+            return
+        if not self.opencv_available: return
+        try:
+            import cv2
+            import numpy as np
+            write_log("正在预加载资源...")
             for task in tasks:
                 path = str(task.get("value", ""))
                 if not path or not os.path.exists(path) or ',' in path: continue
@@ -1220,47 +2453,192 @@ class RPAEngine:
                 img = Image.open(path)
                 img.load()
                 self.img_cache[path] = img
-                task['cache_key'] = path
-            write_log("精简版图片资源预加载完成。")
+                
+                if task.get("custom_en", False):
+                    try:
+                        s_min = float(task.get("custom_scale_min", self.min_scale))
+                        s_max = float(task.get("custom_scale_max", self.max_scale))
+                        s_step = float(task.get("custom_scale_step", self.scale_step))
+                    except:
+                        s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
+                    use_gray = bool(task.get("custom_gray", self.enable_grayscale))
+                else:
+                    s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
+                    use_gray = self.enable_grayscale
+                    
+                cache_key = f"{path}_{s_min}_{s_max}_{s_step}_{use_gray}"
+                task['cache_key'] = cache_key
+                self.scale_options_cache[str(cache_key)] = (s_min, s_max, s_step)
+                
+                if s_min != 1.0 or s_max != 1.0:
+                    if cache_key not in self.scaled_templates_cache:
+                        if use_gray:
+                            if img.mode != 'L': img = img.convert('L')
+                            template = np.array(img)
+                        else:
+                            if img.mode != 'RGB': img = img.convert('RGB')
+                            template = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                            
+                        templates_list = []
+                        safe_step = max(s_step, 0.01)
+                        steps = int((s_max - s_min) / safe_step) + 1
+                        for scale in np.linspace(s_min, s_max, steps):
+                            if 0.99 < scale < 1.01: continue
+                            rw = int(template.shape[1] * scale)
+                            rh = int(template.shape[0] * scale)
+                            if rw < 1 or rh < 1: continue
+                            resized_tpl = cv2.resize(template, (rw, rh))
+                            templates_list.append((scale, resized_tpl))
+                        self.scaled_templates_cache[cache_key] = templates_list
+            write_log("资源预加载完成。")
         except Exception as e:
             write_log(f"预计算失败: {e}")
 
-    def find_target_optimized(self, img_path, cache_key, task_conf, use_gray):
-        active_regions = self.normalized_regions(getattr(self, "scan_regions", []))
-        if active_regions:
-            old_region = self.scan_region
-            old_regions = self.scan_regions
+    def find_target_in_screenshot(self, img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y):
+        if SLIM_BUILD:
             try:
-                self.scan_regions = []
-                for region in active_regions:
-                    if self.check_stop_flag(): return None
-                    self.scan_region = region
-                    found = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
-                    if found:
-                        return found
-            finally:
-                self.scan_region = old_region
-                self.scan_regions = old_regions
+                target = self.img_cache.get(img_path)
+                if target is None:
+                    if not os.path.exists(str(img_path)):
+                        return None
+                    target = Image.open(str(img_path))
+                    target.load()
+                    self.img_cache[img_path] = target
+                res = pyautogui.locate(target, screenshot_pil)
+                if res:
+                    return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
+            except:
+                pass
+            return None
+        if not self.opencv_available:
+            if img_path in self.img_cache:
+                try: 
+                    res = pyautogui.locate(self.img_cache[img_path], screenshot_pil, confidence=task_conf, grayscale=use_gray)
+                    if res: return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
+                except: pass
+            elif os.path.exists(img_path):
+                 try:
+                    res = pyautogui.locate(img_path, screenshot_pil, confidence=task_conf, grayscale=use_gray)
+                    if res: return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
+                 except: pass
             return None
 
-        try: screenshot_pil = pyautogui.screenshot(region=self.scan_region)
-        except: return None
+        import cv2
+        import numpy as np
         
-        offset_x = self.scan_region[0] if self.scan_region else 0
-        offset_y = self.scan_region[1] if self.scan_region else 0
-
-        target = self.img_cache.get(img_path, img_path)
-        if img_path not in self.img_cache and not os.path.exists(str(img_path)):
-            return None
+        screen_np = np.array(screenshot_pil)
+        if use_gray:
+            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2GRAY)
+        else:
+            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+        
+        if img_path not in self.img_cache:
+            if os.path.exists(img_path):
+                try:
+                    img = Image.open(img_path)
+                    img.load()
+                    self.img_cache[img_path] = img
+                except: return None
+            else: return None
+        
+        pil_template = self.img_cache[img_path]
         try:
-            res = pyautogui.locate(target, screenshot_pil)
-            if res:
-                return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
+            if use_gray:
+                if pil_template.mode != 'L': pil_template = pil_template.convert('L')
+                tpl_img = np.array(pil_template)
+            else:
+                if pil_template.mode != 'RGB': pil_template = pil_template.convert('RGB')
+                tpl_img = cv2.cvtColor(np.array(pil_template), cv2.COLOR_RGB2BGR)
+                
+            if tpl_img.shape[0] <= screen_img.shape[0] and tpl_img.shape[1] <= screen_img.shape[1]:
+                res = cv2.matchTemplate(screen_img, tpl_img, cv2.TM_CCOEFF_NORMED)
+                min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
+                if max_v >= task_conf:
+                    h, w = tpl_img.shape[:2]
+                    return (max_l[0] + w//2 + offset_x, max_l[1] + h//2 + offset_y, 1.0)
         except: pass
+        
+        if cache_key in self.scaled_templates_cache:
+            for scale, resized_tpl in self.scaled_templates_cache[cache_key]:
+                if self.check_stop_flag(): return None
+                try:
+                    if resized_tpl.shape[0] > screen_img.shape[0] or resized_tpl.shape[1] > screen_img.shape[1]: continue
+                    res = cv2.matchTemplate(screen_img, resized_tpl, cv2.TM_CCOEFF_NORMED)
+                    min_v, max_v, min_l, max_l = cv2.minMaxLoc(res)
+                    if max_v >= task_conf:
+                        h, w = resized_tpl.shape[:2]
+                        return (max_l[0] + w//2 + offset_x, max_l[1] + h//2 + offset_y, scale)
+                except: continue
+        return None
+
+    def find_target_optimized(self, img_path, cache_key, task_conf, use_gray):
+        position_key = self.target_position_key(img_path, cache_key, task_conf, use_gray)
+        quick_region = self.quick_search_region(img_path, cache_key, task_conf, use_gray)
+        if quick_region:
+            native_found = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=False, quick_region=quick_region)
+            if native_found:
+                found = native_found[0]
+                self.last_target_positions[position_key] = (found[0], found[1])
+                return found
+            try:
+                screenshot_pil, offset_x, offset_y = self.capture_screenshot(quick_region)
+                found = self.find_target_in_screenshot(img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y)
+                if found:
+                    self.last_target_positions[position_key] = (found[0], found[1])
+                    return found
+            except:
+                pass
+            self.last_target_positions.pop(position_key, None)
+
+        native_found = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=False)
+        if native_found:
+            found = native_found[0]
+            self.last_target_positions[position_key] = (found[0], found[1])
+            return found
+
+        try:
+            for screenshot_pil, offset_x, offset_y in self.iter_search_screenshots():
+                if self.check_stop_flag():
+                    return None
+                found = self.find_target_in_screenshot(img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y)
+                if found:
+                    self.last_target_positions[position_key] = (found[0], found[1])
+                    return found
+        except:
+            return None
         return None
 
     def _collect_template_matches(self, screen_img, tpl_img, task_conf, offset_x, offset_y, scale):
-        return []
+        import cv2
+        import numpy as np
+
+        if tpl_img.shape[0] > screen_img.shape[0] or tpl_img.shape[1] > screen_img.shape[1]:
+            return []
+
+        res = cv2.matchTemplate(screen_img, tpl_img, cv2.TM_CCOEFF_NORMED)
+        h, w = tpl_img.shape[:2]
+        kernel_w = max(3, int(w * 0.6))
+        kernel_h = max(3, int(h * 0.6))
+        peak_map = cv2.dilate(res, np.ones((kernel_h, kernel_w), dtype=np.uint8))
+        ys, xs = np.where((res >= task_conf) & (res == peak_map))
+        if len(xs) == 0:
+            return []
+
+        scores = res[ys, xs]
+        if len(xs) > 2000:
+            keep = np.argpartition(scores, -2000)[-2000:]
+            xs, ys, scores = xs[keep], ys[keep], scores[keep]
+
+        matches = []
+        for x, y, score in zip(xs, ys, scores):
+            matches.append({
+                "x": float(x + w // 2 + offset_x),
+                "y": float(y + h // 2 + offset_y),
+                "scale": float(scale),
+                "score": float(score),
+                "radius": max(4.0, min(w, h) * 0.55)
+            })
+        return matches
 
     def _dedupe_targets(self, matches):
         accepted = []
@@ -1326,55 +2704,115 @@ class RPAEngine:
         self.point_click_counts[key] = self.point_click_counts.get(key, 0) + 1
         return self.point_click_counts[key]
 
-    def find_all_targets_optimized(self, img_path, cache_key, task_conf, use_gray):
-        active_regions = self.normalized_regions(getattr(self, "scan_regions", []))
-        if active_regions:
-            old_region = self.scan_region
-            old_regions = self.scan_regions
-            all_targets = []
+    def find_all_targets_in_screenshot(self, img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y):
+        if SLIM_BUILD:
             try:
-                self.scan_regions = []
-                for region in active_regions:
-                    if self.check_stop_flag(): return []
-                    self.scan_region = region
-                    all_targets.extend(self.find_all_targets_optimized(img_path, cache_key, task_conf, use_gray))
-            finally:
-                self.scan_region = old_region
-                self.scan_regions = old_regions
+                target = self.img_cache.get(img_path)
+                if target is None:
+                    if not os.path.exists(str(img_path)):
+                        return []
+                    target = Image.open(str(img_path))
+                    target.load()
+                    self.img_cache[img_path] = target
+                boxes = list(pyautogui.locateAll(target, screenshot_pil))
+                matches = [{
+                    "x": box.left + (box.width / 2) + offset_x,
+                    "y": box.top + (box.height / 2) + offset_y,
+                    "scale": 1.0,
+                    "score": 1.0,
+                    "radius": max(4.0, min(box.width, box.height) * 0.55)
+                } for box in boxes]
+                return [(p["x"], p["y"], p["scale"], p["score"]) for p in self._sort_targets_for_click(self._dedupe_targets(matches))]
+            except:
+                one = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
+                return [(one[0], one[1], one[2], 1.0)] if one else []
+        if not self.opencv_available:
+            try:
+                target = self.img_cache.get(img_path, img_path)
+                boxes = list(pyautogui.locateAll(target, screenshot_pil, confidence=task_conf, grayscale=use_gray))
+                matches = [{
+                    "x": box.left + (box.width / 2) + offset_x,
+                    "y": box.top + (box.height / 2) + offset_y,
+                    "scale": 1.0,
+                    "score": 1.0,
+                    "radius": max(4.0, min(box.width, box.height) * 0.55)
+                } for box in boxes]
+                return [(p["x"], p["y"], p["scale"], p["score"]) for p in self._sort_targets_for_click(self._dedupe_targets(matches))]
+            except:
+                one = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
+                return [(one[0], one[1], one[2], task_conf)] if one else []
 
+        import cv2
+        import numpy as np
+
+        screen_np = np.array(screenshot_pil)
+        if use_gray:
+            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2GRAY)
+        else:
+            screen_img = cv2.cvtColor(screen_np, cv2.COLOR_RGB2BGR)
+
+        if img_path not in self.img_cache:
+            if os.path.exists(img_path):
+                try:
+                    img = Image.open(img_path)
+                    img.load()
+                    self.img_cache[img_path] = img
+                except: return []
+            else: return []
+
+        pil_template = self.img_cache[img_path]
+        matches = []
+        try:
+            if use_gray:
+                if pil_template.mode != 'L': pil_template = pil_template.convert('L')
+                tpl_img = np.array(pil_template)
+            else:
+                if pil_template.mode != 'RGB': pil_template = pil_template.convert('RGB')
+                tpl_img = cv2.cvtColor(np.array(pil_template), cv2.COLOR_RGB2BGR)
+
+            matches.extend(self._collect_template_matches(screen_img, tpl_img, task_conf, offset_x, offset_y, 1.0))
+        except: pass
+
+        if cache_key in self.scaled_templates_cache:
+            for scale, resized_tpl in self.scaled_templates_cache[cache_key]:
+                if self.check_stop_flag(): return []
+                try:
+                    matches.extend(self._collect_template_matches(screen_img, resized_tpl, task_conf, offset_x, offset_y, scale))
+                except: continue
+
+        targets = self._sort_targets_for_click(self._dedupe_targets(matches))
+        return [(p["x"], p["y"], p["scale"], p["score"]) for p in targets]
+
+    def find_all_targets_optimized(self, img_path, cache_key, task_conf, use_gray):
+        native_targets = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=True)
+        if native_targets:
             target_dicts = [{
                 "x": float(x),
                 "y": float(y),
                 "scale": float(scale),
                 "score": float(score),
                 "radius": 8.0
-            } for x, y, scale, score in all_targets]
+            } for x, y, scale, score in native_targets]
             targets = self._sort_targets_for_click(self._dedupe_targets(target_dicts))
             return [(p["x"], p["y"], p["scale"], p["score"]) for p in targets]
 
-        try: screenshot_pil = pyautogui.screenshot(region=self.scan_region)
-        except: return []
-
-        offset_x = self.scan_region[0] if self.scan_region else 0
-        offset_y = self.scan_region[1] if self.scan_region else 0
-
-        target = self.img_cache.get(img_path, img_path)
-        if img_path not in self.img_cache and not os.path.exists(str(img_path)):
-            return []
+        all_targets = []
         try:
-            boxes = list(pyautogui.locateAll(target, screenshot_pil))
-            matches = [{
-                "x": box.left + (box.width / 2) + offset_x,
-                "y": box.top + (box.height / 2) + offset_y,
-                "scale": 1.0,
-                "score": 1.0,
-                "radius": max(4.0, min(box.width, box.height) * 0.55)
-            } for box in boxes]
+            for screenshot_pil, offset_x, offset_y in self.iter_search_screenshots():
+                if self.check_stop_flag():
+                    return []
+                all_targets.extend(self.find_all_targets_in_screenshot(img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y))
         except:
-            one = self.find_target_optimized(img_path, cache_key, task_conf, use_gray)
-            return [(one[0], one[1], one[2], 1.0)] if one else []
+            return []
 
-        targets = self._sort_targets_for_click(self._dedupe_targets(matches))
+        target_dicts = [{
+            "x": float(x),
+            "y": float(y),
+            "scale": float(scale),
+            "score": float(score),
+            "radius": 8.0
+        } for x, y, scale, score in all_targets]
+        targets = self._sort_targets_for_click(self._dedupe_targets(target_dicts))
         return [(p["x"], p["y"], p["scale"], p["score"]) for p in targets]
 
     def get_cmd_name(self, cmd_val):
@@ -1387,20 +2825,10 @@ class RPAEngine:
         return mapping.get(cmd_val, "未知操作")
 
     def parse_coordinate(self, val):
-        try:
-            val_str = str(val).strip()
-            if ',' in val_str:
-                parts = val_str.split(',')
-                if len(parts) == 2:
-                    return int(parts[0].strip()), int(parts[1].strip())
-        except: pass
-        return None
+        return parse_coordinate_text(val)
 
     def parse_float_value(self, value, default=0.0):
-        try:
-            return float(str(value).strip())
-        except:
-            return default
+        return parse_float_text(value, default)
 
     def coord_step_options(self, task):
         if not task or not self.as_bool(task.get("coord_step_en", False)):
@@ -1419,7 +2847,8 @@ class RPAEngine:
             "max_steps": max(0, int(self.parse_float_value(task.get("coord_step_max_steps", 0), 0.0))),
             "max_distance": max(0.0, self.parse_float_value(task.get("coord_step_max_distance", 0), 0.0)),
             "stop": self.as_bool(task.get("coord_step_stop", False)),
-            "reset_after": max(0, int(self.parse_float_value(task.get("coord_step_reset_after", 0), 0.0)))
+            "reset_after": max(0, int(self.parse_float_value(task.get("coord_step_reset_after", 0), 0.0))),
+            "manual_points": parse_coord_step_manual_points(task.get("coord_step_manual_points", "{}"))
         }
 
     def _coord_step_key(self, step_info, base_x, base_y):
@@ -1428,17 +2857,7 @@ class RPAEngine:
     def _coord_step_delta(self, options):
         direction = options.get("direction", "向下")
         distance = options.get("distance", 0.0)
-        if direction == "向上":
-            return 0.0, -distance
-        if direction == "向下":
-            return 0.0, distance
-        if direction == "向左":
-            return -distance, 0.0
-        if direction == "向右":
-            return distance, 0.0
-        if direction == "自定义偏移":
-            return options.get("dx", 0.0), options.get("dy", 0.0)
-        return 0.0, 0.0
+        return coord_step_delta_values(direction, distance, options.get("dx", 0.0), options.get("dy", 0.0))
 
     def _get_coord_step_state(self, step_info, base_x, base_y):
         key = self._coord_step_key(step_info, base_x, base_y)
@@ -1498,6 +2917,9 @@ class RPAEngine:
             ratio = next_index / max_offset_times
             next_x = state["base_x"] + (float(point[0]) - state["base_x"]) * ratio
             next_y = state["base_y"] + (float(point[1]) - state["base_y"]) * ratio
+            manual_point = options.get("manual_points", {}).get(next_index)
+            if manual_point:
+                next_x, next_y = manual_point
         else:
             if options["max_steps"] > 0 and state["offset_times"] >= options["max_steps"]:
                 state["movement_locked"] = True
@@ -1532,11 +2954,12 @@ class RPAEngine:
         if options.get("direction") == "移动到新点位":
             total_points = options["max_steps"] if options["max_steps"] >= 2 else 2
             point_no = min(state["offset_times"] + 1, total_points)
-            return f"       当前点击位置（{int(x)}，{int(y)}），为第{state['offset_times']}次偏移（第{point_no}/{total_points}个点位），将在第{next_after}次后进行下次偏移{reset_text}"
+            manual_text = "，手动修正点" if state["offset_times"] in options.get("manual_points", {}) else ""
+            return f"       当前点击位置（{int(x)}，{int(y)}），为第{state['offset_times']}次偏移（第{point_no}/{total_points}个点位{manual_text}），将在第{next_after}次后进行下次偏移{reset_text}"
 
         return f"       当前点击位置（{int(x)}，{int(y)}），为第{state['offset_times']}次偏移，将在第{next_after}次后进行下次偏移{reset_text}"
 
-    def perform_mouse_click(self, x, y, clickTimes, lOrR):
+    def perform_mouse_click(self, x, y, clickTimes, lOrR, indicator_text=""):
         pyautogui.moveTo(x, y, duration=self.move_duration)
         for _ in range(clickTimes):
             pyautogui.mouseDown(button=lOrR)
@@ -1544,7 +2967,7 @@ class RPAEngine:
             pyautogui.mouseUp(button=lOrR)
             if clickTimes > 1: time.sleep(0.02)
 
-        if self.settlement_wait > 0: time.sleep(self.settlement_wait)
+        self.report_click_indicator(x, y, indicator_text or f"{'左键' if lOrR == 'left' else '右键'}点击")
 
         if self.enable_dodge:
             pyautogui.moveTo(self.dodge_x1, self.dodge_y1, duration=0)
@@ -1552,7 +2975,7 @@ class RPAEngine:
                 time.sleep(self.double_dodge_wait)
                 pyautogui.moveTo(self.dodge_x2, self.dodge_y2, duration=0)
 
-    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, point_limit_en=False, point_limit_count=0, coord_step_config=None):
+    def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, point_limit_en=False, point_limit_count=0, coord_step_config=None, image_click_config=None):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
         start_time = time.time()
         
@@ -1592,9 +3015,13 @@ class RPAEngine:
                 locations = [(location_tuple[0], location_tuple[1], location_tuple[2], task_conf)] if location_tuple else []
 
             if locations:
+                if not coord:
+                    self.reset_recognition_miss(img_path, step_info)
                 if point_limit_en:
                     locations = self._filter_point_limit_targets(locations, img_path, step_info, point_limit_en, point_limit_count)
                     if not locations:
+                        if not coord:
+                            self.record_recognition_miss(img_path, step_info)
                         if self.log_level >= 1:
                             self.log(f"<font color='orange'>    [跳过] 循环#{step_info['loop']} 步{step_info['step']}: 当前图片所有识别点位都已达到同点点击上限</font>")
                         return "not_found"
@@ -1611,16 +3038,25 @@ class RPAEngine:
                             self.log(f"    -> 共识别到 {len(click_locations)} 个可点击目标，按【{self.multi_target_order}】顺序执行点击")
                     elif self.log_level >= 1:
                         x, y, scale, _score = click_locations[0]
-                        self.log(f"    -> 已在坐标 ({int(x)}, {int(y)}) 锁定目标并执行点击")
+                        click_x, click_y = self.adjusted_image_click_point(img_path, click_locations[0], image_click_config)
+                        if image_click_config:
+                            self.log(f"    -> 已在坐标 ({int(x)}, {int(y)}) 锁定目标，实际点击图片内位置 ({int(click_x)}, {int(click_y)})")
+                        else:
+                            self.log(f"    -> 已在坐标 ({int(x)}, {int(y)}) 锁定目标并执行点击")
 
                     for target_idx, location_tuple in enumerate(click_locations, 1):
                         if self.check_stop_flag(): return "stopped"
                         x, y, scale, score = location_tuple
+                        click_x, click_y = self.adjusted_image_click_point(img_path, location_tuple, image_click_config)
                         if use_all_targets and self.log_level >= 2:
-                            self.log(f"       多目标 {target_idx}/{len(click_locations)} -> ({int(x)}, {int(y)}) 相似度 {score:.3f} 缩放 {scale:.2f}x")
+                            if image_click_config:
+                                self.log(f"       多目标 {target_idx}/{len(click_locations)} -> 命中中心({int(x)}, {int(y)})，点击({int(click_x)}, {int(click_y)})，相似度 {score:.3f} 缩放 {scale:.2f}x")
+                            else:
+                                self.log(f"       多目标 {target_idx}/{len(click_locations)} -> ({int(x)}, {int(y)}) 相似度 {score:.3f} 缩放 {scale:.2f}x")
                         if coord_step_config and coord_state and self.log_level >= 2:
                             self.log(self.coord_step_log_message(x, y, coord_state, coord_step_config))
-                        self.perform_mouse_click(x, y, clickTimes, lOrR)
+                        click_label = ("左键" if lOrR == "left" else "右键") + ("双击" if clickTimes == 2 else "单击")
+                        self.perform_mouse_click(click_x, click_y, clickTimes, lOrR, click_label)
                         if coord_step_config and coord_state:
                             step_result = self._advance_coord_step_state(coord_state, coord_step_config, step_info)
                             if step_result == "locked_stop":
@@ -1638,6 +3074,8 @@ class RPAEngine:
                     return "error"
                 return "success"
             else:
+                if not coord:
+                    self.record_recognition_miss(img_path, step_info)
                 if reTry != -1:
                     if self.log_level >= 1:
                         self.log(f"<font color='orange'>    [未找到] 循环#{step_info['loop']} 步{step_info['step']}: 未能识别到目标图片 ({os.path.basename(img_path)})</font>")
@@ -1646,7 +3084,7 @@ class RPAEngine:
                     if not waiting_logged and self.log_level >= 1:
                         self.log(f"    -> 未发现目标，进入持续监听等待状态...")
                         waiting_logged = True
-                    if not self.wait_recognition_interval():
+                    if not self.wait_recognition_interval(self.adaptive_extra_delay(img_path, step_info)):
                         return "stopped"
                     continue
 
@@ -1669,15 +3107,15 @@ class RPAEngine:
         time.sleep(self.click_hold)
         pyautogui.moveTo(x2, y2, duration=max(self.move_duration, 0.3))
         pyautogui.mouseUp(button=button)
-        if self.settlement_wait > 0: time.sleep(self.settlement_wait)
+        self.report_click_indicator(x2, y2, "拖拽结束")
         return "success"
 
-    def execute_task_once(self, cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en=False, point_limit_count=0, coord_step_config=None):
+    def execute_task_once(self, cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en=False, point_limit_count=0, coord_step_config=None, image_click_config=None):
         status = "success"
         try:
-            if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
-            elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
-            elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
+            if cmd == 1.0: status = self.mouseClick(1, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config, image_click_config)
+            elif cmd == 2.0: status = self.mouseClick(2, "left", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config, image_click_config)
+            elif cmd == 3.0: status = self.mouseClick(1, "right", val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config, image_click_config)
             elif cmd == 10.0: status = self.mouseDrag("left", val, step_info)
             elif cmd == 11.0: status = self.mouseDrag("right", val, step_info)
             elif cmd == 12.0:
@@ -1711,6 +3149,7 @@ class RPAEngine:
                     if self.log_level >= 1:
                         self.log(f"    -> 已悬停在坐标 ({int(x)}, {int(y)})")
                     pyautogui.moveTo(x, y, duration=self.move_duration)
+                    self.report_click_indicator(x, y, "悬停")
                 else:
                     status = "not_found"
                     if self.log_level >= 1:
@@ -1744,16 +3183,20 @@ class RPAEngine:
                 self.log(f"<font color='red'>    [严重异常] 循环#{step_info['loop']} 步{step_info['step']}: 执行崩溃 -> {step_e}</font>")
         return status
 
-    def run_tasks(self, tasks, callback_msg=None, callback_status=None):
+    def run_tasks(self, tasks, callback_msg=None, callback_status=None, callback_click_indicator=None):
         self.is_running = True
         self.stop_requested = False
         self.callback_msg = callback_msg
         self.callback_status = callback_status
+        self.callback_click_indicator = callback_click_indicator
         
         self.img_cache = {}
         self.scaled_templates_cache = {}
+        self.scale_options_cache = {}
         self.point_click_counts = {}
         self.coord_step_states = {}
+        self.miss_streaks = {}
+        self.last_target_positions = {}
         self.load_and_precompute(tasks)
         
         global_start_time = time.time()
@@ -1763,6 +3206,11 @@ class RPAEngine:
             while True:
                 loop_count += 1
                 
+                if self.loop_end_round > 0 and loop_count > self.loop_end_round:
+                    if self.log_level >= 0:
+                        self.log(f"<font color='green'>>>> 提示: 已达到全局循环停止轮次 ({self.loop_end_round})，任务正常结束</font>")
+                    break
+
                 if self.loop_mode == "单次" and loop_count > 1: break
                 elif self.loop_mode == "指定次数" and loop_count > self.loop_val:
                     if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定循环次数 ({int(self.loop_val)}次)，任务正常结束</font>")
@@ -1777,6 +3225,12 @@ class RPAEngine:
                     if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定运行时间，任务正常结束</font>")
                     break
 
+                if loop_count < self.loop_start_round:
+                    self.report_status(loop_count, 0, len(tasks), "等待循环范围")
+                    if self.log_level >= 1:
+                        self.log(f"<font color='gray'>循环 #{loop_count} 低于全局起始循环 {self.loop_start_round}，本轮不执行步骤。</font>")
+                    continue
+
                 self.report_status(loop_count, 0, len(tasks), "")
 
                 idx = min(max(int(getattr(self, "start_step_index", 0)), 0), max(len(tasks) - 1, 0))
@@ -1786,6 +3240,19 @@ class RPAEngine:
                     if self.check_stop_flag():
                         if callback_msg: callback_msg("任务由看门狗终止")
                         return
+
+                    step_loop_start = self.positive_int_value(task.get("step_loop_start", 1), 1)
+                    step_loop_end = self.non_negative_int_value(task.get("step_loop_end", 0), 0)
+                    if loop_count < step_loop_start:
+                        if self.log_level >= 2:
+                            self.log(f"<font color='gray'>循环 #{loop_count} 步 {idx+1} 尚未到起始循环 {step_loop_start}，跳过本步。</font>")
+                        idx += 1
+                        continue
+                    if step_loop_end > 0 and loop_count > step_loop_end:
+                        if self.log_level >= 2:
+                            self.log(f"<font color='gray'>循环 #{loop_count} 步 {idx+1} 已超过结束循环 {step_loop_end}，跳过本步。</font>")
+                        idx += 1
+                        continue
 
                     cmd = task.get("type")
                     val = task.get("value")
@@ -1805,6 +3272,9 @@ class RPAEngine:
                     coord_step_config = None
                     if cmd in [1.0, 2.0, 3.0] and self.parse_coordinate(val):
                         coord_step_config = self.coord_step_options(task)
+                    image_click_config = None
+                    if cmd in [1.0, 2.0, 3.0] and not self.parse_coordinate(val):
+                        image_click_config = self.image_click_point_options(task)
                     
                     if task.get("custom_en", False):
                         try: task_conf = float(task.get("custom_conf", self.confidence))
@@ -1864,9 +3334,10 @@ class RPAEngine:
                         step_start_time = time.time()
 
                         needs_recognition_wait = cmd in [1.0, 2.0, 3.0, 8.0] and not self.parse_coordinate(val)
-                        if (needs_recognition_wait or no_skip_wait) and not self.wait_recognition_interval():
+                        extra_delay = self.adaptive_extra_delay(val, step_info) if needs_recognition_wait else 0.0
+                        if (needs_recognition_wait or no_skip_wait) and not self.wait_recognition_interval(extra_delay):
                             return
-                        status = self.execute_task_once(cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config)
+                        status = self.execute_task_once(cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config, image_click_config)
 
                         step_duration = time.time() - step_start_time
                         if self.log_level >= 0:
@@ -1898,6 +3369,8 @@ class RPAEngine:
                             if no_skip_wait and status != "timeout":
                                 if self.log_level >= 1:
                                     self.log(f"    -> 本步骤已启用禁止跳过，将继续等待本步骤成功。")
+                                if not self.is_wait_command(cmd) and not self.wait_step_interval():
+                                    return
                                 continue
                             consecutive_failures += 1
                             if consecutive_failures >= fail_limit:
@@ -1908,6 +3381,10 @@ class RPAEngine:
                         else:
                             success_count += 1
                             consecutive_failures = 0
+
+                        if target_successes is None or success_count < target_successes:
+                            if not self.is_wait_command(cmd) and not self.wait_step_interval():
+                                return
 
                     next_idx = idx + 1
                     if step_failed_for_branch:
@@ -1929,6 +3406,10 @@ class RPAEngine:
                             if self.log_level >= 0:
                                 self.log(f"<font color='#4CAF50'><b>    -> [条件分支] 成功后跳过后续 {success_skip} 步指令</b></font>")
 
+                    if self.should_wait_step_interval(tasks, cmd, next_idx, loop_count):
+                        if not self.wait_step_interval():
+                            return
+
                     idx = next_idx
 
                 if self.check_stop_flag(): return
@@ -1938,6 +3419,7 @@ class RPAEngine:
         finally:
             self.is_running = False
             self.callback_status = None
+            self.callback_click_indicator = None
             if callback_msg: callback_msg("结束")
 
 # --------------------------
@@ -1946,6 +3428,7 @@ class RPAEngine:
 class WorkerThread(QThread):
     log_signal = Signal(str)
     status_signal = Signal(dict)
+    click_signal = Signal(dict)
     finished_signal = Signal()
     def __init__(self, engine, tasks):
         super().__init__()
@@ -1955,7 +3438,7 @@ class WorkerThread(QThread):
     def run(self):
         self.watchdog = FailsafeWatchdog(self.engine)
         self.watchdog.start()
-        self.engine.run_tasks(self.tasks, self.log_callback, self.status_callback)
+        self.engine.run_tasks(self.tasks, self.log_callback, self.status_callback, self.click_callback)
         if self.watchdog: self.watchdog.kill()
         self.finished_signal.emit()
 
@@ -1965,6 +3448,9 @@ class WorkerThread(QThread):
 
     def status_callback(self, data):
         self.status_signal.emit(data)
+
+    def click_callback(self, data):
+        self.click_signal.emit(data)
 
 class TaskRow(QFrame):
     def __init__(self, delete_callback):
@@ -1979,6 +3465,8 @@ class TaskRow(QFrame):
             "custom_gray": True,
             "repeat_mode": "执行一次",
             "repeat_count": "1",
+            "step_loop_start": "1",
+            "step_loop_end": "0",
             "fail_limit": "1",
             "success_skip": "0",
             "success_jump": "0",
@@ -1987,6 +3475,9 @@ class TaskRow(QFrame):
             "no_skip_wait": False,
             "point_limit_en": False,
             "point_limit_count": "0",
+            "image_click_point_en": False,
+            "image_click_point_rx": "0.5",
+            "image_click_point_ry": "0.5",
             "coord_step_en": False,
             "coord_step_every": "1",
             "coord_step_direction": "向下",
@@ -1997,7 +3488,8 @@ class TaskRow(QFrame):
             "coord_step_max_steps": "0",
             "coord_step_max_distance": "0",
             "coord_step_stop": False,
-            "coord_step_reset_after": "0"
+            "coord_step_reset_after": "0",
+            "coord_step_manual_points": "{}"
         }
         
         self.setFrameShape(QFrame.StyledPanel)
@@ -2010,6 +3502,14 @@ class TaskRow(QFrame):
         self.index_label.setAlignment(Qt.AlignCenter)
         self.index_label.setStyleSheet("color: gray; font-weight: bold;")
         self.layout.addWidget(self.index_label)
+
+        self.manual_mark_label = QLabel("修")
+        self.manual_mark_label.setFixedWidth(18)
+        self.manual_mark_label.setAlignment(Qt.AlignCenter)
+        self.manual_mark_label.setToolTip("本步骤包含坐标步进手动修正点")
+        self.manual_mark_label.setStyleSheet("color: white; background-color: #9C27B0; border-radius: 4px; font-weight: bold;")
+        self.manual_mark_label.hide()
+        self.layout.addWidget(self.manual_mark_label)
         
         self.type_combo = QComboBox()
         self.type_combo.addItems([
@@ -2062,12 +3562,13 @@ class TaskRow(QFrame):
     def sync_data(self):
         text = self.type_combo.currentText()
         coord_mode = self.is_direct_coordinate_value(text)
+        self.update_manual_marker()
         if "单击" in text or "双击" in text or "悬停" in text:
             self.cfg_btn.setVisible(True)
             if coord_mode:
                 self.cfg_btn.setToolTip("步骤设置\n当前参数是屏幕坐标，图片识别参数会自动忽略；重复和条件分支仍然生效")
             else:
-                self.cfg_btn.setToolTip("步骤设置\n包含图片识别参数、重复次数、同点点击上限和条件分支")
+                self.cfg_btn.setToolTip("步骤设置\n包含图片识别参数、图片内点击点、重复次数、同点点击上限和条件分支")
         else:
             self.cfg_btn.setVisible(True)
             self.cfg_btn.setToolTip("步骤设置\n包含重复次数和条件分支")
@@ -2083,7 +3584,18 @@ class TaskRow(QFrame):
         value = self.value_input.text().replace("\n", " ").strip()
         if len(value) > 80:
             value = value[:77] + "..."
-        return f"{self.index_label.text()} {self.type_combo.currentText()} | {value}"
+        mark = " [修]" if self.has_coord_step_manual_points() else ""
+        return f"{self.index_label.text()}{mark} {self.type_combo.currentText()} | {value}"
+
+    def has_coord_step_manual_points(self):
+        return (
+            config_bool(self.custom_data.get("coord_step_en", False))
+            and str(self.custom_data.get("coord_step_direction", "")) == "移动到新点位"
+            and bool(parse_coord_step_manual_points(self.custom_data.get("coord_step_manual_points", "{}")))
+        )
+
+    def update_manual_marker(self):
+        self.manual_mark_label.setVisible(self.has_coord_step_manual_points())
 
     def is_coordinate_pickable(self, text=None):
         if text is None:
@@ -2099,6 +3611,9 @@ class TaskRow(QFrame):
                 return True
         except: pass
         return False
+
+    def direct_coordinate_tuple(self):
+        return parse_coordinate_text(self.value_input.text())
 
     def is_direct_coordinate_value(self, text=None):
         if text is None:
@@ -2125,10 +3640,24 @@ class TaskRow(QFrame):
             self.config_dialog.activateWindow()
             return
 
-        dialog = TaskConfigDialog(None, self.custom_data, self.image_settings_available(), self.point_limit_available(), self.coordinate_step_available())
+        self._config_original_value = self.value_input.text()
+        dialog = TaskConfigDialog(
+            None,
+            self.custom_data,
+            self.image_settings_available(),
+            self.point_limit_available(),
+            self.coordinate_step_available(),
+            self.direct_coordinate_tuple(),
+            self.value_input.text().strip(),
+            self.image_click_point_available(),
+            self.on_config_base_coordinate_changed
+        )
         self.config_dialog = dialog
         dialog.accepted.connect(lambda d=dialog: self.apply_custom_config(d))
-        dialog.finished.connect(lambda _result, d=dialog: self.clear_custom_config_dialog(d))
+        dialog.finished.connect(lambda result, d=dialog: self.clear_custom_config_dialog(d, result))
+        main_window = self.window()
+        if hasattr(main_window, "apply_ui_scale_to_widget"):
+            main_window.apply_ui_scale_to_widget(dialog)
         dialog.show()
         dialog.raise_()
         dialog.activateWindow()
@@ -2137,7 +3666,19 @@ class TaskRow(QFrame):
         self.custom_data = dialog.get_data()
         self.sync_data()
 
-    def clear_custom_config_dialog(self, dialog):
+    def on_config_base_coordinate_changed(self, value):
+        self.value_input.setText(str(value))
+        if getattr(self, "config_dialog", None):
+            self.config_dialog.base_coordinate = parse_coordinate_text(value)
+            self.config_dialog.update_coord_step_ui()
+        self.sync_data()
+
+    def clear_custom_config_dialog(self, dialog, result=None):
+        if result != QDialog.Accepted and hasattr(self, "_config_original_value"):
+            self.value_input.setText(self._config_original_value)
+            self.sync_data()
+        if hasattr(self, "_config_original_value"):
+            del self._config_original_value
         if getattr(self, "config_dialog", None) is dialog:
             self.config_dialog = None
         dialog.deleteLater()
@@ -2153,6 +3694,14 @@ class TaskRow(QFrame):
         if text not in ["左键单击", "左键双击", "右键单击"]:
             return False
         return not self.is_direct_coordinate_value(text)
+
+    def image_click_point_available(self):
+        text = self.type_combo.currentText()
+        if text not in ["左键单击", "左键双击", "右键单击"]:
+            return False
+        if self.is_direct_coordinate_value(text):
+            return False
+        return os.path.isfile(self.value_input.text().strip())
 
     def coordinate_step_available(self):
         text = self.type_combo.currentText()
@@ -2208,6 +3757,8 @@ class TaskRow(QFrame):
             "custom_gray": data.get("custom_gray", True),
             "repeat_mode": data.get("repeat_mode", "执行一次"),
             "repeat_count": data.get("repeat_count", "1"),
+            "step_loop_start": data.get("step_loop_start", "1"),
+            "step_loop_end": data.get("step_loop_end", "0"),
             "fail_limit": data.get("fail_limit", "1"),
             "success_skip": data.get("success_skip", "0"),
             "success_jump": data.get("success_jump", "0"),
@@ -2216,6 +3767,9 @@ class TaskRow(QFrame):
             "no_skip_wait": data.get("no_skip_wait", False),
             "point_limit_en": data.get("point_limit_en", False),
             "point_limit_count": data.get("point_limit_count", "0"),
+            "image_click_point_en": data.get("image_click_point_en", False),
+            "image_click_point_rx": data.get("image_click_point_rx", "0.5"),
+            "image_click_point_ry": data.get("image_click_point_ry", "0.5"),
             "coord_step_en": data.get("coord_step_en", False),
             "coord_step_every": data.get("coord_step_every", "1"),
             "coord_step_direction": data.get("coord_step_direction", "向下"),
@@ -2226,8 +3780,10 @@ class TaskRow(QFrame):
             "coord_step_max_steps": data.get("coord_step_max_steps", "0"),
             "coord_step_max_distance": data.get("coord_step_max_distance", "0"),
             "coord_step_stop": data.get("coord_step_stop", False),
-            "coord_step_reset_after": data.get("coord_step_reset_after", "0")
+            "coord_step_reset_after": data.get("coord_step_reset_after", "0"),
+            "coord_step_manual_points": data.get("coord_step_manual_points", "{}")
         }
+        self.update_manual_marker()
         
         TYPES_REV = {
             1.0: "左键单击", 2.0: "左键双击", 3.0: "右键单击", 4.0: "输入文本", 
@@ -2264,8 +3820,12 @@ class TaskRow(QFrame):
         if self.is_direct_coordinate_value(self.type_combo.currentText()):
             data_dict["custom_en"] = False
             data_dict["point_limit_en"] = False
+            data_dict["image_click_point_en"] = False
         else:
             data_dict["coord_step_en"] = False
+            data_dict["coord_step_manual_points"] = "{}"
+            if not self.image_click_point_available():
+                data_dict["image_click_point_en"] = False
         return data_dict
 
     def set_index(self, index):
@@ -2399,13 +3959,17 @@ class DraggableListWidget(QListWidget):
 class RPAWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("RPA配置工具（浮夸改v1.4 精简版）")
+        self.setWindowTitle("RPA配置工具（浮夸改v1.5 精简版）")
         self.resize(800, 850)
         self.engine = RPAEngine()
         
         self.config_path = os.path.join(get_base_dir(), "config.ini")
         self.settings = QSettings(self.config_path, QSettings.IniFormat)
+        self.ui_base_font = QFont(QApplication.font())
+        self.ui_scale = 1.0
         self.recorder_ui = None
+        self.all_points_preview = None
+        self.click_indicator_overlays = []
         
         geometry = self.settings.value("window_geometry")
         if geometry:
@@ -2417,6 +3981,7 @@ class RPAWindow(QMainWindow):
         
         self.hotkey_start_vk = 0x78 
         self.hotkey_stop_vk = 0x79  
+        self.global_hotkeys_registered = False
         self.current_process = None
         self.running_overlay = None
         self.task_clipboard = None
@@ -2494,8 +4059,13 @@ class RPAWindow(QMainWindow):
         region_btn.setStyleSheet("background-color: #9C27B0; color: white; font-weight: bold;")
         region_btn.clicked.connect(self.open_region_selector)
         top_bar.addWidget(region_btn)
+
+        preview_points_btn = QPushButton("预览坐标点")
+        preview_points_btn.setToolTip("在屏幕上预览当前脚本中所有直接坐标点击点；仅统计坐标点击，不识别图片。")
+        preview_points_btn.clicked.connect(self.show_all_coordinate_click_preview)
+        top_bar.addWidget(preview_points_btn)
         
-        top_bar.addWidget(HelpBtn("【设定识别区域】\n如CPU占用较高，务必使用此功能！\n左键拖拽框选一个或多个区域，右键完成。\n只画一个区域就是普通用法；连续画多个区域就是高级合并用法。\n搜索范围越小，找图速度越快。"))
+        top_bar.addWidget(HelpBtn("【设定识别区域】\n如CPU占用较高，务必使用此功能。\n左键拖拽框选一个或多个区域，右键完成。\n多区域适合目标分散在几个相距较远的小区域，且这些区域总面积只占屏幕很小一部分的情况。\n如果几个区域相隔很近，通常框成一个较大的单区域更快、更稳定。"))
         top_bar.addStretch()
         main_layout.addLayout(top_bar)
 
@@ -2533,6 +4103,7 @@ class RPAWindow(QMainWindow):
         # ================= 核心折叠设置区 =================
         # 1. 识别配置
         g1 = CollapsibleSection("全局识别配置")
+        gl1_wrap = QVBoxLayout()
         gl1 = QHBoxLayout()
         gl1.addWidget(QLabel("相似:"))
         self.conf_edit = QLineEdit("0.8"); self.conf_edit.setFixedWidth(70); gl1.addWidget(self.conf_edit)
@@ -2551,14 +4122,29 @@ class RPAWindow(QMainWindow):
         self.gray_chk = QCheckBox("全局灰度匹配 (极速)"); self.gray_chk.setChecked(True); gl1.addWidget(self.gray_chk)
         gl1.addWidget(HelpBtn("【灰度匹配】\n开启后极快且省CPU。如果两张图形状一样颜色不同，请关闭！"))
         gl1.addStretch()
-        g1.set_content_layout(gl1)
-        settings_content_layout.addWidget(g1)
+        gl1_native = QHBoxLayout()
+        self.native_core_chk = QCheckBox("启用DLL原生识别")
+        self.native_core_chk.setChecked(True)
+        self.native_core_chk.setToolTip("开启后优先使用内置 water_rpa_core.dll 做图片识别；不可用或不适合时自动回退到原来的 OpenCV/Python 识别。")
+        gl1_native.addWidget(self.native_core_chk)
+        gl1_native.addWidget(HelpBtn("【DLL原生识别】\n开启后，图片点击/悬停会优先尝试使用内置 C++ DLL 识别核心，通常可降低部分识别场景的 CPU 压力并提高速度。\n如果遇到兼容性问题、识别结果异常，或想对比旧版效果，可以关闭；关闭后完全使用原来的 OpenCV/Python 识别路径。\nDLL 加载失败时会自动回退，不会影响脚本启动。"))
+        gl1_native.addStretch()
+        gl1_wrap.addLayout(gl1)
+        gl1_wrap.addLayout(gl1_native)
         if SLIM_BUILD:
-            g1.hide()
-            slim_note = QLabel("精简版识别模式：已去掉相似度、缩放识别、灰度识别和 OpenCV/NumPy 运行库，仅按原图原尺寸精确匹配。")
-            slim_note.setStyleSheet("color: #666; font-weight: bold;")
+            self.scale_min.setText("1.0")
+            self.scale_max.setText("1.0")
+            self.scale_step.setText("0.05")
+            self.gray_chk.setChecked(False)
+            self.native_core_chk.setChecked(False)
+            for widget in [self.scale_min, self.scale_max, self.scale_step, self.gray_chk, self.native_core_chk]:
+                widget.setEnabled(False)
+            slim_note = QLabel("精简版：已移除缩放识别、灰度识别、DLL 原生识别、OpenCV/NumPy 运行库，仅按原图原尺寸精确匹配。")
+            slim_note.setStyleSheet("color: #666;")
             slim_note.setWordWrap(True)
-            settings_content_layout.addWidget(slim_note)
+            gl1_wrap.addWidget(slim_note)
+        g1.set_content_layout(gl1_wrap)
+        settings_content_layout.addWidget(g1)
         
         # 2. 避让设置
         g_dodge = CollapsibleSection("避让设置")
@@ -2592,8 +4178,8 @@ class RPAWindow(QMainWindow):
         gl2.addWidget(QLabel("按住(s):")); self.click_hld = QLineEdit("0.04"); self.click_hld.setFixedWidth(70); gl2.addWidget(self.click_hld)
         gl2.addWidget(HelpBtn("【按住时长】 建议0.04-0.08模拟真人点击"))
         gl2.addSpacing(15)
-        gl2.addWidget(QLabel("缓冲(s):")); self.settle = QLineEdit("0.0"); self.settle.setFixedWidth(70); gl2.addWidget(self.settle)
-        gl2.addWidget(HelpBtn("【结算缓冲】 点击后的等待时间"))
+        gl2.addWidget(QLabel("间隔(s):")); self.settle = QLineEdit("0.5"); self.settle.setFixedWidth(70); gl2.addWidget(self.settle)
+        gl2.addWidget(HelpBtn("【步间隔】\n每一步执行完毕后等待多久再进入下一步；0 表示立刻执行下一步。\n优先级低于“等待”指令：如果当前步骤是等待，或下一步实际要执行的是等待，程序会自动屏蔽等待指令前后的全局间隔。\n例如：第1步点击、第2步等待3秒、第3步点击，则第1步后不会额外加间隔，第2步后也不会额外加间隔，确保第1步后准确等待3秒再执行第3步。"))
         gl2.addSpacing(15)
         gl2.addWidget(QLabel("超时(s):")); self.timeout = QLineEdit("0.0"); self.timeout.setFixedWidth(70); gl2.addWidget(self.timeout)
         gl2.addWidget(HelpBtn("【单步超时】\n0 表示不设置等待上限。\n未开启“超时急停”时：达到超时会把本步骤视为失败，再按小齿轮里的失败跳过/跳至规则处理。\n开启“超时急停”时：达到超时会立即停止整个脚本和后续循环。"))
@@ -2601,8 +4187,14 @@ class RPAWindow(QMainWindow):
         self.timeout_stop_chk.setToolTip("开启后，任意步骤达到单步超时都会立即停止全部循环，不再执行后续步骤。")
         gl2.addWidget(self.timeout_stop_chk)
         gl2.addSpacing(15)
-        gl2.addWidget(QLabel("识别频率(s):")); self.detect_delay = QLineEdit("0"); self.detect_delay.setFixedWidth(70); gl2.addWidget(self.detect_delay)
+        gl2.addWidget(QLabel("识别频率(s):")); self.detect_delay = QLineEdit("0.1"); self.detect_delay.setFixedWidth(70); gl2.addWidget(self.detect_delay)
         gl2.addWidget(HelpBtn("【识别频率】\n每次执行识别/重试前先等待这么多秒，用于降低CPU占用。\n0 表示不额外等待，速度最快但CPU压力更高。"))
+        gl2.addSpacing(15)
+        self.adaptive_backoff_chk = QCheckBox("自适应降频")
+        self.adaptive_backoff_chk.setChecked(True)
+        self.adaptive_backoff_chk.setToolTip("连续找不到同一目标时自动逐步放慢重试；找到目标后自动恢复。")
+        gl2.addWidget(self.adaptive_backoff_chk)
+        gl2.addWidget(HelpBtn("【自适应降频】\n开启后，如果某张图连续多次找不到，程序会在识别频率之外额外等待一点时间，避免CPU一直满速空转。\n找到目标后会自动清零恢复速度。"))
         gl2.addSpacing(15)
         gl2.addWidget(QLabel("倍速:")); self.playback_speed = QLineEdit("1.0"); self.playback_speed.setFixedWidth(70); gl2.addWidget(self.playback_speed)
         gl2.addWidget(HelpBtn("【倍速执行】 用于缩放录制的等待指令时间，> 1 为加速"))
@@ -2619,7 +4211,7 @@ class RPAWindow(QMainWindow):
         self.multi_mode_combo.setFixedWidth(120)
         self.multi_mode_combo.currentTextChanged.connect(self.update_multi_target_ui)
         gl_multi.addWidget(self.multi_mode_combo)
-        gl_multi.addWidget(HelpBtn("【目标模式】\n最佳一个：沿用原逻辑，只点击相似度最高的目标。\n全部匹配：一次找出所有超过相似度阈值的目标并逐个点击。"))
+        gl_multi.addWidget(HelpBtn("【目标模式】\n最佳一个：走最快路径，只计算当前截图里相似度最高的一个位置并点击，适合普通单目标脚本。\n全部匹配：执行更完整的峰值搜索，一次找出所有超过相似度阈值的目标并逐个点击，CPU压力更高。"))
         gl_multi.addSpacing(15)
         gl_multi.addWidget(QLabel("点击顺序:"))
         self.multi_order_combo = QComboBox()
@@ -2663,9 +4255,8 @@ class RPAWindow(QMainWindow):
         self.log_file_chk = QCheckBox("写入文件日志"); gl3_r2.addWidget(self.log_file_chk)
         self.log_ui_chk = QCheckBox("界面日志"); self.log_ui_chk.setChecked(True); gl3_r2.addWidget(self.log_ui_chk)
         gl3_r2.addSpacing(15)
-        self.mini_chk = QCheckBox("启动时最小化"); gl3_r2.addWidget(self.mini_chk)
+        self.mini_chk = QCheckBox("启动时最小化")
         self.top_chk = QCheckBox("窗口置顶"); self.top_chk.stateChanged.connect(self.toggle_top_window)
-        gl3_r2.addWidget(self.top_chk)
         gl3_r2.addStretch()
 
         gl3_r3 = QHBoxLayout()
@@ -2679,6 +4270,12 @@ class RPAWindow(QMainWindow):
         gl3_r3.addWidget(self.run_status_pos_combo)
         gl3_r3.addWidget(HelpBtn("【运行状态提示】\n脚本运行时在屏幕角落显示“脚本正在执行中”、当前循环、当前步骤和已运行时间。"))
         gl3_r3.addSpacing(15)
+        self.click_indicator_chk = QCheckBox("点击位置提示")
+        self.click_indicator_chk.setChecked(True)
+        self.click_indicator_chk.setToolTip("脚本执行点击、拖拽或悬停时，在屏幕上短暂标出实际位置。")
+        gl3_r3.addWidget(self.click_indicator_chk)
+        gl3_r3.addWidget(HelpBtn("【点击位置提示】\n开启后，脚本每次点击、拖拽结束或鼠标悬停时，会在屏幕上短暂显示一个定位标记，方便确认刚刚操作了哪里。\n关闭后不显示定位标记，脚本执行逻辑不变。"))
+        gl3_r3.addSpacing(15)
         gl3_r3.addWidget(QLabel("从第"))
         self.start_step_edit = QLineEdit("1")
         self.start_step_edit.setFixedWidth(60)
@@ -2687,6 +4284,21 @@ class RPAWindow(QMainWindow):
         gl3_r3.addWidget(HelpBtn("【从第X步开始执行】\n默认 1。启动脚本后每轮循环都从这里开始；成功/失败跳至仍按列表中的实际步号计算。"))
         gl3_r3.addStretch()
 
+        gl3_r3b = QHBoxLayout()
+        gl3_r3b.addWidget(QLabel("脚本从第"))
+        self.loop_start_round_edit = QLineEdit("1")
+        self.loop_start_round_edit.setFixedWidth(60)
+        gl3_r3b.addWidget(self.loop_start_round_edit)
+        gl3_r3b.addWidget(QLabel("次循环开始"))
+        gl3_r3b.addSpacing(15)
+        gl3_r3b.addWidget(QLabel("到第"))
+        self.loop_end_round_edit = QLineEdit("0")
+        self.loop_end_round_edit.setFixedWidth(60)
+        gl3_r3b.addWidget(self.loop_end_round_edit)
+        gl3_r3b.addWidget(QLabel("次循环停止"))
+        gl3_r3b.addWidget(HelpBtn("【全局循环范围】\n从第几次循环开始真正执行步骤；前面的循环轮次会直接跳过。\n停止循环填 0 表示不限；填 5 表示执行到第 5 次循环后结束。\n这个设置和“从第X步开始”不同：它控制第几轮循环生效。"))
+        gl3_r3b.addStretch()
+
         gl3_r4 = QHBoxLayout()
         self.low_power_ui_chk = QCheckBox("省电UI模式")
         self.low_power_ui_chk.setChecked(True)
@@ -2694,11 +4306,19 @@ class RPAWindow(QMainWindow):
         self.low_power_ui_chk.stateChanged.connect(self.apply_ui_performance_mode)
         gl3_r4.addWidget(self.low_power_ui_chk)
         gl3_r4.addWidget(HelpBtn("【省电UI模式】\n只影响界面刷新和热键轮询频率，不改变脚本识别逻辑。\n如果你感觉热键响应慢，可以关闭。"))
+        gl3_r4.addSpacing(15)
+        gl3_r4.addWidget(QLabel("界面倍率(%):"))
+        self.ui_scale_edit = QLineEdit("100")
+        self.ui_scale_edit.setFixedWidth(60)
+        self.ui_scale_edit.setToolTip("调整主界面、设置窗口和小齿轮窗口的字体与控件尺寸，建议范围 75-180。")
+        gl3_r4.addWidget(self.ui_scale_edit)
+        gl3_r4.addWidget(HelpBtn("【界面倍率】\n用于适配不同分辨率或缩放习惯的显示屏。\n100 表示原始大小；例如 125 会把字体和多数按钮/输入框放大到 125%。\n倍率过大时窗口内容需要更多空间，可以手动拉大窗口。"))
         gl3_r4.addStretch()
         
         gl3_main.addLayout(gl3_r1)
         gl3_main.addLayout(gl3_r2)
         gl3_main.addLayout(gl3_r3)
+        gl3_main.addLayout(gl3_r3b)
         gl3_main.addLayout(gl3_r4)
         g3.set_content_layout(gl3_main)
         settings_content_layout.addWidget(g3)
@@ -2741,13 +4361,18 @@ class RPAWindow(QMainWindow):
         self.update_loop_ui(self.loop_combo.currentText())
         
         bot_layout.addStretch()
+        bot_layout.addWidget(self.mini_chk)
+        bot_layout.addWidget(self.top_chk)
+        bot_layout.addSpacing(10)
         
         self.start_btn = QPushButton("启动"); self.start_btn.clicked.connect(self.start_task)
-        self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; width: 100px; height: 30px;")
+        self.start_btn.setMinimumSize(100, 30)
+        self.start_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
         bot_layout.addWidget(self.start_btn)
         
         self.stop_btn = QPushButton("停止"); self.stop_btn.clicked.connect(self.stop_task)
-        self.stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold; width: 100px; height: 30px;")
+        self.stop_btn.setMinimumSize(100, 30)
+        self.stop_btn.setStyleSheet("background-color: #f44336; color: white; font-weight: bold;")
         self.stop_btn.setEnabled(False)
         bot_layout.addWidget(self.stop_btn)
         
@@ -2784,10 +4409,11 @@ class RPAWindow(QMainWindow):
         
         self.hotkey_timer = QTimer()
         self.hotkey_timer.timeout.connect(self.check_hotkey)
-        self.hotkey_timer.start(self.current_hotkey_interval())
+        self.hotkey_timer.setInterval(self.current_hotkey_interval())
         
         self.init_profiles()
         self.bind_setting_logs()
+        self.update_hotkeys()
 
     def open_config_dir(self):
         try:
@@ -2816,6 +4442,87 @@ class RPAWindow(QMainWindow):
         if getattr(self, "cpu_timer", None):
             self.cpu_timer.setInterval(self.current_cpu_interval())
 
+    def parse_ui_scale_percent(self):
+        raw = str(getattr(self, "ui_scale_edit", QLineEdit("100")).text()).strip().replace("%", "")
+        value = parse_float_text(raw, 100.0)
+        value = max(75.0, min(180.0, value))
+        if abs(value - round(value)) < 0.01:
+            text = str(int(round(value)))
+        else:
+            text = f"{value:.1f}".rstrip("0").rstrip(".")
+        if getattr(self, "ui_scale_edit", None) and self.ui_scale_edit.text().strip().replace("%", "") != text:
+            self.ui_scale_edit.setText(text)
+        return value
+
+    def apply_ui_scale_from_edit(self, *_):
+        percent = self.parse_ui_scale_percent()
+        self.apply_ui_scale(percent / 100.0)
+        if not self.is_switching_profile:
+            self.log_setting_change("界面倍率(%)", self.ui_scale_edit.text())
+
+    def apply_ui_scale_to_widgets(self, widgets, scale):
+        qwidget_max = 16777215
+        for widget in widgets:
+            if widget is None:
+                continue
+            try:
+                if not widget.property("_ui_scale_base_saved"):
+                    widget.setProperty("_ui_scale_base_saved", True)
+                    widget.setProperty("_ui_base_min_w", widget.minimumWidth())
+                    widget.setProperty("_ui_base_min_h", widget.minimumHeight())
+                    widget.setProperty("_ui_base_max_w", widget.maximumWidth())
+                    widget.setProperty("_ui_base_max_h", widget.maximumHeight())
+
+                min_w = int(widget.property("_ui_base_min_w") or 0)
+                min_h = int(widget.property("_ui_base_min_h") or 0)
+                max_w = int(widget.property("_ui_base_max_w") or qwidget_max)
+                max_h = int(widget.property("_ui_base_max_h") or qwidget_max)
+
+                if min_w > 0:
+                    widget.setMinimumWidth(max(1, int(round(min_w * scale))))
+                if min_h > 0:
+                    widget.setMinimumHeight(max(1, int(round(min_h * scale))))
+                if 0 < max_w < qwidget_max:
+                    widget.setMaximumWidth(max(1, int(round(max_w * scale))))
+                if 0 < max_h < qwidget_max:
+                    widget.setMaximumHeight(max(1, int(round(max_h * scale))))
+            except RuntimeError:
+                continue
+            except Exception:
+                continue
+
+    def apply_ui_scale_to_widget(self, widget):
+        if not widget:
+            return
+        scale = float(getattr(self, "ui_scale", 1.0))
+        widgets = [widget] + widget.findChildren(QWidget)
+        self.apply_ui_scale_to_widgets(widgets, scale)
+
+    def apply_ui_scale(self, scale):
+        scale = max(0.75, min(1.8, float(scale)))
+        self.ui_scale = scale
+        try:
+            font = QFont(self.ui_base_font)
+            if font.pointSizeF() > 0:
+                font.setPointSizeF(max(6.0, self.ui_base_font.pointSizeF() * scale))
+            elif font.pixelSize() > 0:
+                font.setPixelSize(max(8, int(round(self.ui_base_font.pixelSize() * scale))))
+            QApplication.setFont(font)
+        except:
+            pass
+        try:
+            self.apply_ui_scale_to_widgets(QApplication.allWidgets(), scale)
+            self.updateGeometry()
+            if getattr(self, "settings_dialog", None):
+                self.settings_dialog.updateGeometry()
+            for i in range(self.task_list.count()):
+                item = self.task_list.item(i)
+                widget = self.task_list.itemWidget(item)
+                if widget:
+                    item.setSizeHint(widget.sizeHint())
+        except:
+            pass
+
     def show_settings_dialog(self):
         self.settings_dialog.show()
         self.settings_dialog.raise_()
@@ -2837,6 +4544,86 @@ class RPAWindow(QMainWindow):
     def hide_running_status_overlay(self):
         if self.running_overlay:
             self.running_overlay.stop_overlay()
+
+    def show_click_indicator_overlay(self, data):
+        try:
+            overlay = ClickPointOverlay(data.get("x", 0), data.get("y", 0), data.get("text", ""))
+            if not hasattr(self, "click_indicator_overlays"):
+                self.click_indicator_overlays = []
+            self.click_indicator_overlays.append(overlay)
+            overlay.destroyed.connect(lambda *_args, o=overlay: self.click_indicator_overlays.remove(o) if o in self.click_indicator_overlays else None)
+        except Exception as e:
+            write_log(f"显示点击位置提示失败: {e}")
+
+    def coordinate_preview_options_from_task(self, task):
+        return {
+            "every": max(1, int(parse_float_text(task.get("coord_step_every", 1), 1))),
+            "direction": str(task.get("coord_step_direction", "向下")),
+            "distance": parse_float_text(task.get("coord_step_distance", 0), 0.0),
+            "dx": parse_float_text(task.get("coord_step_dx", 0), 0.0),
+            "dy": parse_float_text(task.get("coord_step_dy", 0), 0.0),
+            "point": str(task.get("coord_step_point", "")).strip(),
+            "max_steps": max(0, int(parse_float_text(task.get("coord_step_max_steps", 0), 0.0))),
+            "max_distance": max(0.0, parse_float_text(task.get("coord_step_max_distance", 0), 0.0)),
+            "reset_after": max(0, int(parse_float_text(task.get("coord_step_reset_after", 0), 0.0))),
+            "manual_points": parse_coord_step_manual_points(task.get("coord_step_manual_points", "{}"))
+        }
+
+    def collect_coordinate_click_preview_points(self, max_points=800):
+        points = []
+        truncated = False
+        tasks = self.get_current_ui_config().get("tasks", [])
+        for task in tasks:
+            try:
+                cmd = float(task.get("type", 0))
+            except:
+                continue
+            if cmd not in [1.0, 2.0, 3.0]:
+                continue
+            coord = parse_coordinate_text(task.get("value", ""))
+            if not coord:
+                continue
+
+            step_points = [coord]
+            if config_bool(task.get("coord_step_en", False)):
+                options = self.coordinate_preview_options_from_task(task)
+                step_points = build_coord_step_positions(coord[0], coord[1], options, max_points=120)
+            for point in step_points:
+                points.append(point)
+                if len(points) >= max_points:
+                    truncated = True
+                    return points, truncated
+        return points, truncated
+
+    def show_all_coordinate_click_preview(self):
+        points, truncated = self.collect_coordinate_click_preview_points()
+        if not points:
+            QMessageBox.information(self, "无法预览", "当前脚本没有直接坐标点击步骤。\n图片识别点击不会参与此预览。")
+            return
+        self.close_all_coordinate_click_preview()
+        suffix = "，已截断前 800 个" if truncated else ""
+        title = f"坐标点击总预览：{len(points)} 个点位{suffix}；仅显示直接坐标点击，左键/右键/Esc 可关闭"
+        self.all_points_preview = CoordinateStepPreviewOverlay(
+            points,
+            {"direction": "全部坐标点击"},
+            title=title,
+            auto_close_ms=15000,
+            draw_lines=True,
+            detail_text="坐标步进点表示该步骤多次执行时会轮到的位置，实际执行不会在单次步骤里一次点完全部点。"
+        )
+        self.all_points_preview.destroyed.connect(self.clear_all_coordinate_click_preview)
+
+    def clear_all_coordinate_click_preview(self, *_):
+        self.all_points_preview = None
+
+    def close_all_coordinate_click_preview(self):
+        preview = getattr(self, "all_points_preview", None)
+        if preview:
+            try:
+                preview.close()
+            except RuntimeError:
+                pass
+            self.all_points_preview = None
 
     def append_log(self, msg):
         scrollbar = self.log_text.verticalScrollBar()
@@ -2867,15 +4654,15 @@ class RPAWindow(QMainWindow):
 
     def get_default_config_dict(self):
         return {
-            "conf": "0.8", "scale_min": "0.8", "scale_max": "1.2", "scale_step": "0.05", "gray_en": True,
+            "conf": "0.8", "scale_min": "1.0" if SLIM_BUILD else "0.8", "scale_max": "1.0" if SLIM_BUILD else "1.2", "scale_step": "0.05", "gray_en": False if SLIM_BUILD else True, "native_core_en": False if SLIM_BUILD else True,
             "dodge_x1": "100", "dodge_y1": "100", "dodge_x2": "200", "dodge_y2": "100",
             "dodge_en": False, "dbl_dodge": False, "dbl_wait": "0.015",
-            "move_spd": "0.0", "click_hld": "0.04", "settle": "0.0", "timeout": "0.0", "timeout_stop": False, "detect_delay": "0", "playback_speed": "1.0",
+            "move_spd": "0.0", "click_hld": "0.04", "settle": "0.5", "timeout": "0.0", "timeout_stop": False, "detect_delay": "0.1", "adaptive_backoff": True, "playback_speed": "1.0",
             "multi_target_mode": "最佳一个", "multi_target_order": "从上到下",
             "hotkey_start": "F9", "hotkey_stop": "F10", "log_level": 0,
             "tm_fs": True, "tr_fs": True, "key_fs": True,
             "log_f": False, "log_ui": True, "mini": False, "top": False,
-            "run_status_tip": True, "run_status_pos": "右上角", "start_step": "1", "low_power_ui": True,
+            "run_status_tip": True, "run_status_pos": "右上角", "click_indicator": True, "start_step": "1", "loop_start_round": "1", "loop_end_round": "0", "low_power_ui": True, "ui_scale": "100",
             "loop_mode": "单次", "loop_val": "10",
             "scan_region": None, "scan_regions": [],
             "tasks": []
@@ -2890,15 +4677,15 @@ class RPAWindow(QMainWindow):
             else: tasks.append(item.data(Qt.UserRole))
             
         return {
-            "conf": self.conf_edit.text(), "scale_min": self.scale_min.text(), "scale_max": self.scale_max.text(), "scale_step": self.scale_step.text(), "gray_en": self.gray_chk.isChecked(),
+            "conf": self.conf_edit.text(), "scale_min": self.scale_min.text(), "scale_max": self.scale_max.text(), "scale_step": self.scale_step.text(), "gray_en": self.gray_chk.isChecked(), "native_core_en": self.native_core_chk.isChecked(),
             "dodge_x1": self.dodge_x1.text(), "dodge_y1": self.dodge_y1.text(), "dodge_x2": self.dodge_x2.text(), "dodge_y2": self.dodge_y2.text(),
             "dodge_en": self.dodge_chk.isChecked(), "dbl_dodge": self.double_dodge_chk.isChecked(), "dbl_wait": self.dbl_wait.text(),
-            "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "timeout_stop": self.timeout_stop_chk.isChecked(), "detect_delay": self.detect_delay.text(), "playback_speed": self.playback_speed.text(),
+            "move_spd": self.move_spd.text(), "click_hld": self.click_hld.text(), "settle": self.settle.text(), "timeout": self.timeout.text(), "timeout_stop": self.timeout_stop_chk.isChecked(), "detect_delay": self.detect_delay.text(), "adaptive_backoff": self.adaptive_backoff_chk.isChecked(), "playback_speed": self.playback_speed.text(),
             "multi_target_mode": self.multi_mode_combo.currentText(), "multi_target_order": self.multi_order_combo.currentText(),
             "hotkey_start": self.hotkey_start_combo.currentText(), "hotkey_stop": self.hotkey_stop_combo.currentText(), "log_level": self.log_level_combo.currentIndex(),
             "tm_fs": self.tm_failsafe.isChecked(), "tr_fs": self.tr_failsafe.isChecked(), "key_fs": self.key_failsafe.isChecked(),
             "log_f": self.log_file_chk.isChecked(), "log_ui": self.log_ui_chk.isChecked(), "mini": self.mini_chk.isChecked(), "top": self.top_chk.isChecked(),
-            "run_status_tip": self.run_status_chk.isChecked(), "run_status_pos": self.run_status_pos_combo.currentText(), "start_step": self.start_step_edit.text(), "low_power_ui": self.low_power_ui_chk.isChecked(),
+            "run_status_tip": self.run_status_chk.isChecked(), "run_status_pos": self.run_status_pos_combo.currentText(), "click_indicator": self.click_indicator_chk.isChecked(), "start_step": self.start_step_edit.text(), "loop_start_round": self.loop_start_round_edit.text(), "loop_end_round": self.loop_end_round_edit.text(), "low_power_ui": self.low_power_ui_chk.isChecked(), "ui_scale": self.ui_scale_edit.text(),
             "loop_mode": self.loop_combo.currentText(), "loop_val": self.loop_val_edit.text(),
             "scan_region": self.engine.scan_region, "scan_regions": self.engine.scan_regions,
             "tasks": tasks
@@ -2911,6 +4698,13 @@ class RPAWindow(QMainWindow):
             self.scale_max.setText(str(cfg.get("scale_max", "1.2")))
             self.scale_step.setText(str(cfg.get("scale_step", "0.05")))
             self.gray_chk.setChecked(bool(cfg.get("gray_en", True)))
+            self.native_core_chk.setChecked(config_bool(cfg.get("native_core_en", True)))
+            if SLIM_BUILD:
+                self.scale_min.setText("1.0")
+                self.scale_max.setText("1.0")
+                self.scale_step.setText("0.05")
+                self.gray_chk.setChecked(False)
+                self.native_core_chk.setChecked(False)
             self.dodge_x1.setText(str(cfg.get("dodge_x1", "100")))
             self.dodge_y1.setText(str(cfg.get("dodge_y1", "100")))
             self.dodge_x2.setText(str(cfg.get("dodge_x2", "200")))
@@ -2921,10 +4715,11 @@ class RPAWindow(QMainWindow):
             
             self.move_spd.setText(str(cfg.get("move_spd", "0.0")))
             self.click_hld.setText(str(cfg.get("click_hld", "0.04")))
-            self.settle.setText(str(cfg.get("settle", "0.0")))
+            self.settle.setText(str(cfg.get("settle", "0.5")))
             self.timeout.setText(str(cfg.get("timeout", "0.0")))
             self.timeout_stop_chk.setChecked(config_bool(cfg.get("timeout_stop", False)))
-            self.detect_delay.setText(str(cfg.get("detect_delay", "0")))
+            self.detect_delay.setText(str(cfg.get("detect_delay", "0.1")))
+            self.adaptive_backoff_chk.setChecked(config_bool(cfg.get("adaptive_backoff", True)))
             self.playback_speed.setText(str(cfg.get("playback_speed", "1.0")))
             self.multi_mode_combo.setCurrentText(str(cfg.get("multi_target_mode", "最佳一个")))
             self.multi_order_combo.setCurrentText(str(cfg.get("multi_target_order", "从上到下")))
@@ -2944,8 +4739,12 @@ class RPAWindow(QMainWindow):
             self.top_chk.setChecked(bool(cfg.get("top", False)))
             self.run_status_chk.setChecked(bool(cfg.get("run_status_tip", True)))
             self.run_status_pos_combo.setCurrentText(str(cfg.get("run_status_pos", "右上角")))
+            self.click_indicator_chk.setChecked(config_bool(cfg.get("click_indicator", True)))
             self.start_step_edit.setText(str(cfg.get("start_step", "1")))
+            self.loop_start_round_edit.setText(str(cfg.get("loop_start_round", "1")))
+            self.loop_end_round_edit.setText(str(cfg.get("loop_end_round", "0")))
             self.low_power_ui_chk.setChecked(config_bool(cfg.get("low_power_ui", True)))
+            self.ui_scale_edit.setText(str(cfg.get("ui_scale", "100")))
             self.apply_ui_performance_mode()
             
             self.loop_combo.setCurrentText(str(cfg.get("loop_mode", "单次")))
@@ -2958,6 +4757,7 @@ class RPAWindow(QMainWindow):
             
             self.update_log_config()
             self.update_hotkeys()
+            self.apply_ui_scale(self.parse_ui_scale_percent() / 100.0)
         except Exception as e:
             write_log(f"应用配置失败: {e}")
 
@@ -3069,14 +4869,18 @@ class RPAWindow(QMainWindow):
         self.dbl_wait.editingFinished.connect(lambda: self.log_setting_change("二段避让间隔(s)", self.dbl_wait.text()))
         self.move_spd.editingFinished.connect(lambda: self.log_setting_change("移动耗时(s)", self.move_spd.text()))
         self.click_hld.editingFinished.connect(lambda: self.log_setting_change("按住时长(s)", self.click_hld.text()))
-        self.settle.editingFinished.connect(lambda: self.log_setting_change("结算缓冲(s)", self.settle.text()))
+        self.settle.editingFinished.connect(lambda: self.log_setting_change("步间隔(s)", self.settle.text()))
         self.timeout.editingFinished.connect(lambda: self.log_setting_change("单步超时(s)", self.timeout.text()))
         self.detect_delay.editingFinished.connect(lambda: self.log_setting_change("识别频率(s)", self.detect_delay.text()))
         self.playback_speed.editingFinished.connect(lambda: self.log_setting_change("倍速执行", self.playback_speed.text()))
         self.loop_val_edit.editingFinished.connect(lambda: self.log_setting_change("循环参数", self.loop_val_edit.text()))
         self.start_step_edit.editingFinished.connect(lambda: self.log_setting_change("从第X步开始", self.start_step_edit.text()))
+        self.loop_start_round_edit.editingFinished.connect(lambda: self.log_setting_change("脚本起始循环", self.loop_start_round_edit.text()))
+        self.loop_end_round_edit.editingFinished.connect(lambda: self.log_setting_change("脚本停止循环", self.loop_end_round_edit.text()))
+        self.ui_scale_edit.editingFinished.connect(self.apply_ui_scale_from_edit)
 
         self.gray_chk.stateChanged.connect(lambda s: self.log_setting_change("灰度匹配", "开启" if s else "关闭"))
+        self.native_core_chk.stateChanged.connect(lambda s: self.log_setting_change("DLL原生识别", "开启" if s else "关闭"))
         self.dodge_chk.stateChanged.connect(lambda s: self.log_setting_change("启用避让", "开启" if s else "关闭"))
         self.double_dodge_chk.stateChanged.connect(lambda s: self.log_setting_change("二段避让", "开启" if s else "关闭"))
         self.tm_failsafe.stateChanged.connect(lambda s: self.log_setting_change("任务管理器急停", "开启" if s else "关闭"))
@@ -3085,13 +4889,17 @@ class RPAWindow(QMainWindow):
         self.log_file_chk.stateChanged.connect(lambda s: self.log_setting_change("写入文件日志", "开启" if s else "关闭"))
         self.log_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("显示界面日志", "开启" if s else "关闭"))
         self.mini_chk.stateChanged.connect(lambda s: self.log_setting_change("启动时最小化", "开启" if s else "关闭"))
+        self.top_chk.stateChanged.connect(lambda s: self.log_setting_change("窗口置顶", "开启" if s else "关闭"))
         self.run_status_chk.stateChanged.connect(lambda s: self.log_setting_change("运行状态提示", "开启" if s else "关闭"))
+        self.click_indicator_chk.stateChanged.connect(lambda s: self.log_setting_change("点击位置提示", "开启" if s else "关闭"))
         self.timeout_stop_chk.stateChanged.connect(lambda s: self.log_setting_change("超时急停", "开启" if s else "关闭"))
         self.low_power_ui_chk.stateChanged.connect(lambda s: self.log_setting_change("省电UI模式", "开启" if s else "关闭"))
+        self.adaptive_backoff_chk.stateChanged.connect(lambda s: self.log_setting_change("自适应降频", "开启" if s else "关闭"))
         
         self.hotkey_start_combo.currentTextChanged.connect(lambda t: self.log_setting_change("启动热键", t))
         self.hotkey_stop_combo.currentTextChanged.connect(lambda t: self.log_setting_change("停止热键", t))
         self.log_level_combo.currentTextChanged.connect(lambda t: self.log_setting_change("日志级别", t))
+        self.log_level_combo.currentTextChanged.connect(self.warn_heavy_log_level)
         self.loop_combo.currentTextChanged.connect(lambda t: self.log_setting_change("循环模式", t))
         self.multi_mode_combo.currentTextChanged.connect(lambda t: self.log_setting_change("多目标模式", t))
         self.multi_order_combo.currentTextChanged.connect(lambda t: self.log_setting_change("多目标顺序", t))
@@ -3100,6 +4908,19 @@ class RPAWindow(QMainWindow):
     def log_setting_change(self, name, value):
         if GLOBAL_CONFIG["log_to_ui"] and not self.is_switching_profile:
             self.append_log(f"<font color='#FF9800'><b>设置已生效：</b>{name} -> {value}</font>")
+
+    def warn_heavy_log_level(self, text):
+        if self.is_switching_profile or text == "简易":
+            return
+        if self.settings.value("ack_heavy_log_warning", "") == "1":
+            return
+        QMessageBox.warning(
+            self,
+            "日志性能提示",
+            "详细/完全日志会更频繁地刷新界面，可能拖慢UI响应，尤其是完全日志。\n\n"
+            "如果运行时感觉卡顿，可以切回“简易”，或者关闭“界面日志”。"
+        )
+        self.settings.setValue("ack_heavy_log_warning", "1")
 
     def update_loop_ui(self, text):
         if text in ["指定次数", "指定时间(时)", "指定时间(分)", "指定时间(秒)"]:
@@ -3144,6 +4965,56 @@ class RPAWindow(QMainWindow):
         self.engine.scan_region = single[0] if single else None
         self.update_region_label()
 
+    def hotkey_hwnd(self):
+        return wintypes.HWND(int(self.winId()))
+
+    def unregister_global_hotkeys(self):
+        hwnd = self.hotkey_hwnd()
+        for hotkey_id in (HOTKEY_ID_START, HOTKEY_ID_STOP):
+            try:
+                user32.UnregisterHotKey(hwnd, hotkey_id)
+            except:
+                pass
+        self.global_hotkeys_registered = False
+
+    def register_global_hotkeys(self):
+        try:
+            self.unregister_global_hotkeys()
+            hwnd = self.hotkey_hwnd()
+            start_ok = bool(user32.RegisterHotKey(hwnd, HOTKEY_ID_START, MOD_NOREPEAT, self.hotkey_start_vk))
+            stop_ok = bool(user32.RegisterHotKey(hwnd, HOTKEY_ID_STOP, MOD_NOREPEAT, self.hotkey_stop_vk))
+            if start_ok and stop_ok:
+                self.global_hotkeys_registered = True
+                return True
+            write_log("注册全局热键失败，可能热键已被其他程序占用，回退到轮询模式。")
+            self.unregister_global_hotkeys()
+        except Exception as e:
+            write_log(f"注册全局热键失败，回退到轮询模式: {e}")
+        self.global_hotkeys_registered = False
+        return False
+
+    def refresh_hotkey_backend(self):
+        if not getattr(self, "hotkey_timer", None):
+            return
+        if self.register_global_hotkeys():
+            self.hotkey_timer.stop()
+        else:
+            self.hotkey_timer.start(self.current_hotkey_interval())
+
+    def nativeEvent(self, eventType, message):
+        try:
+            msg = wintypes.MSG.from_address(int(message))
+            if msg.message == WM_HOTKEY:
+                if msg.wParam == HOTKEY_ID_START and not self.engine.is_running:
+                    QTimer.singleShot(0, self.start_task)
+                    return True, 0
+                if msg.wParam == HOTKEY_ID_STOP and self.engine.is_running:
+                    QTimer.singleShot(0, self.stop_task)
+                    return True, 0
+        except:
+            pass
+        return super().nativeEvent(eventType, message)
+
     def update_hotkeys(self, _=None):
         try:
             start_txt = self.hotkey_start_combo.currentText()
@@ -3152,6 +5023,7 @@ class RPAWindow(QMainWindow):
             self.hotkey_stop_vk = 0x70 + (int(stop_txt.replace("F", "")) - 1)
             self.start_btn.setText(f"启动 ({start_txt})")
             self.stop_btn.setText(f"停止 ({stop_txt})")
+            self.refresh_hotkey_backend()
         except: pass
 
     def toggle_top_window(self):
@@ -3175,13 +5047,13 @@ class RPAWindow(QMainWindow):
         if start_pressed and not self.engine.is_running:
             self.start_task()
             self.hotkey_timer.stop()
-            QTimer.singleShot(500, lambda: self.hotkey_timer.start(self.current_hotkey_interval()))
+            QTimer.singleShot(500, lambda: self.hotkey_timer.start(self.current_hotkey_interval()) if not self.global_hotkeys_registered else None)
             return
             
         if stop_pressed and self.engine.is_running:
             self.stop_task()
             self.hotkey_timer.stop()
-            QTimer.singleShot(500, lambda: self.hotkey_timer.start(self.current_hotkey_interval()))
+            QTimer.singleShot(500, lambda: self.hotkey_timer.start(self.current_hotkey_interval()) if not self.global_hotkeys_registered else None)
             return
 
     def open_region_selector(self):
@@ -3209,12 +5081,19 @@ class RPAWindow(QMainWindow):
     def closeEvent(self, event):
         """终极修复：强力异常捕获+强制放行，确保不管什么情况点X号都能瞬间关掉软件"""
         try:
+            self.unregister_global_hotkeys()
             self.settings.setValue("window_geometry", self.saveGeometry())
             if getattr(self, "settings_dialog", None):
                 self.settings_dialog.save_dialog_geometry()
             self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
             self.settings.setValue("profiles_json", json.dumps(self.profiles_data))
             self.settings.setValue("current_profile", self.current_profile_name)
+            self.close_all_coordinate_click_preview()
+            for overlay in list(getattr(self, "click_indicator_overlays", [])):
+                try:
+                    overlay.close()
+                except RuntimeError:
+                    pass
             
             if getattr(self, 'worker', None) and self.worker.isRunning():
                 self.engine.stop()
@@ -3222,6 +5101,7 @@ class RPAWindow(QMainWindow):
                 self.worker.wait(1000)
             if self.running_overlay:
                 self.running_overlay.close()
+            self.close_all_coordinate_click_preview()
         except Exception as e:
             write_log(f"退出前保存异常: {e}")
         finally:
@@ -3466,6 +5346,17 @@ class RPAWindow(QMainWindow):
         if not start_step.isdigit() or int(start_step) < 1 or int(start_step) > len(tasks):
             return f"设置里的'从第X步开始执行'必须是 1 到 {len(tasks)} 之间的整数！\n填入内容: {start_step}"
 
+        loop_start_round = str(self.loop_start_round_edit.text()).strip()
+        loop_end_round = str(self.loop_end_round_edit.text()).strip()
+        if not loop_start_round.isdigit() or int(loop_start_round) < 1:
+            return f"设置里的'脚本从第X次循环开始'必须是大于等于 1 的整数！\n填入内容: {loop_start_round}"
+        if not loop_end_round.isdigit() or int(loop_end_round) < 0:
+            return f"设置里的'到第X次循环停止'必须是大于等于 0 的整数！\n填入内容: {loop_end_round}"
+        if int(loop_end_round) > 0 and int(loop_end_round) < int(loop_start_round):
+            return f"设置里的'到第X次循环停止'不能小于起始循环！\n起始循环: {loop_start_round}，停止循环: {loop_end_round}"
+        if self.loop_combo.currentText() == "单次" and int(loop_start_round) > 1:
+            return "当前是'单次'循环模式，脚本起始循环必须为 1；如果要从第多次循环开始，请把循环模式改为'无限'或'指定次数'。"
+
         for i, task in enumerate(tasks):
             t = task.get("type")
             v = str(task.get("value", "")).strip()
@@ -3475,8 +5366,13 @@ class RPAWindow(QMainWindow):
             fail_jump = str(task.get("fail_jump", "0")).strip()
             repeat_mode = str(task.get("repeat_mode", "执行一次"))
             repeat_count = str(task.get("repeat_count", "1")).strip()
+            step_loop_start = str(task.get("step_loop_start", "1")).strip()
+            step_loop_end = str(task.get("step_loop_end", "0")).strip()
             fail_limit = str(task.get("fail_limit", "1")).strip()
             point_limit_count = str(task.get("point_limit_count", "0")).strip()
+            image_click_point_en = config_bool(task.get("image_click_point_en", False))
+            image_click_point_rx = str(task.get("image_click_point_rx", "0.5")).strip()
+            image_click_point_ry = str(task.get("image_click_point_ry", "0.5")).strip()
             coord_step_en = config_bool(task.get("coord_step_en", False))
             coord_step_every = str(task.get("coord_step_every", "1")).strip()
             coord_step_direction = str(task.get("coord_step_direction", "向下")).strip()
@@ -3500,8 +5396,24 @@ class RPAWindow(QMainWindow):
                 return f"第 {i+1} 步小齿轮里的'连续失败次数'必须是大于等于 1 的整数！\n填入内容: {fail_limit}"
             if repeat_mode == "指定次数" and (not repeat_count.isdigit() or int(repeat_count) < 1):
                 return f"第 {i+1} 步小齿轮里的'重复次数'必须是大于等于 1 的整数！\n填入内容: {repeat_count}"
+            if not step_loop_start.isdigit() or int(step_loop_start) < 1:
+                return f"第 {i+1} 步小齿轮里的'循环范围起始'必须是大于等于 1 的整数！\n填入内容: {step_loop_start}"
+            if not step_loop_end.isdigit() or int(step_loop_end) < 0:
+                return f"第 {i+1} 步小齿轮里的'循环范围停止'必须是大于等于 0 的整数！\n填入内容: {step_loop_end}"
+            if int(step_loop_end) > 0 and int(step_loop_end) < int(step_loop_start):
+                return f"第 {i+1} 步小齿轮里的'循环范围停止'不能小于起始循环！\n起始循环: {step_loop_start}，停止循环: {step_loop_end}"
             if point_limit_count and not point_limit_count.isdigit():
                 return f"第 {i+1} 步小齿轮里的'同点点击上限'必须是大于等于 0 的整数！\n填入内容: {point_limit_count}"
+            if image_click_point_en:
+                if t not in [1.0, 2.0, 3.0] or self.engine.parse_coordinate(v) or not os.path.isfile(v):
+                    return f"第 {i+1} 步小齿轮里的'图片内点击点'仅能用于左键/右键图片点击步骤，且参数必须是存在的图片路径。\n填入内容: {v}"
+                try:
+                    rx = float(image_click_point_rx)
+                    ry = float(image_click_point_ry)
+                    if not (0.0 <= rx <= 1.0 and 0.0 <= ry <= 1.0):
+                        return f"第 {i+1} 步小齿轮里的'图片内点击点'相对位置必须在 0 到 1 之间！\n填入内容: X={image_click_point_rx}, Y={image_click_point_ry}"
+                except:
+                    return f"第 {i+1} 步小齿轮里的'图片内点击点'相对位置必须是数字！\n填入内容: X={image_click_point_rx}, Y={image_click_point_ry}"
             if coord_step_en and t in [1.0, 2.0, 3.0] and self.engine.parse_coordinate(v):
                 if not coord_step_every.isdigit() or int(coord_step_every) < 1:
                     return f"第 {i+1} 步小齿轮里的'步进频率'必须是大于等于 1 的整数！\n填入内容: {coord_step_every}"
@@ -3550,7 +5462,11 @@ class RPAWindow(QMainWindow):
 
     def analyze_loop_risks(self, tasks, cfg):
         risks = []
-        if cfg.get("loop_mode") == "无限":
+        try:
+            global_loop_end = int(float(cfg.get("loop_end_round", 0)))
+        except:
+            global_loop_end = 0
+        if cfg.get("loop_mode") == "无限" and global_loop_end <= 0:
             risks.append("全局循环模式为【无限】，脚本会在步骤列表执行完后重新开始，直到手动停止或急停。")
 
         for i, task in enumerate(tasks):
@@ -3592,11 +5508,15 @@ class RPAWindow(QMainWindow):
 
         signature_src = json.dumps({
             "loop_mode": cfg.get("loop_mode"),
+            "loop_start_round": cfg.get("loop_start_round"),
+            "loop_end_round": cfg.get("loop_end_round"),
             "risks": risks,
             "tasks": [
                 {
                     "type": task.get("type"),
                     "repeat_mode": task.get("repeat_mode"),
+                    "step_loop_start": task.get("step_loop_start"),
+                    "step_loop_end": task.get("step_loop_end"),
                     "no_skip_wait": task.get("no_skip_wait"),
                     "coord_step_en": task.get("coord_step_en"),
                     "coord_step_reset_after": task.get("coord_step_reset_after"),
@@ -3650,14 +5570,26 @@ class RPAWindow(QMainWindow):
             self.engine.dodge_x2 = int(cfg["dodge_x2"])
             self.engine.dodge_y2 = int(cfg["dodge_y2"])
             self.engine.move_duration = float(cfg["move_spd"])
-            self.engine.click_hld = float(cfg["click_hld"])
+            self.engine.click_hold = float(cfg["click_hld"])
             self.engine.settlement_wait = float(cfg["settle"])
             self.engine.timeout_val = float(cfg["timeout"])
             self.engine.timeout_stop = config_bool(cfg.get("timeout_stop", False))
             self.engine.confidence = float(cfg["conf"])
             self.engine.detect_delay = float(cfg["detect_delay"]) 
+            self.engine.adaptive_backoff = config_bool(cfg.get("adaptive_backoff", True))
+            self.engine.use_native_core = config_bool(cfg.get("native_core_en", True))
+            if SLIM_BUILD:
+                self.engine.min_scale = 1.0
+                self.engine.max_scale = 1.0
+                self.engine.scale_step = 0.05
+                self.engine.enable_grayscale = False
+                self.engine.use_native_core = False
+            self.engine.show_click_indicator = config_bool(cfg.get("click_indicator", True))
+            self.engine.use_fast_screenshot = True
             self.engine.playback_speed = float(cfg.get("playback_speed", "1.0"))
             self.engine.start_step_index = max(0, int(float(cfg.get("start_step", "1"))) - 1)
+            self.engine.loop_start_round = max(1, int(float(cfg.get("loop_start_round", "1"))))
+            self.engine.loop_end_round = max(0, int(float(cfg.get("loop_end_round", "0"))))
             self.engine.multi_target_mode = cfg.get("multi_target_mode", "最佳一个")
             self.engine.multi_target_order = cfg.get("multi_target_order", "从上到下")
             
@@ -3682,8 +5614,11 @@ class RPAWindow(QMainWindow):
             if multi_info == "全部匹配":
                 multi_info = f"{multi_info}/{cfg.get('multi_target_order', '从上到下')}"
             start_step = int(float(cfg.get("start_step", "1")))
+            loop_start_round = int(float(cfg.get("loop_start_round", "1")))
+            loop_end_round = int(float(cfg.get("loop_end_round", "0")))
+            loop_range_info = f"循环范围: 第{loop_start_round}次起" + (f" 至第{loop_end_round}次" if loop_end_round > 0 else "")
             timeout_mode = "超时急停" if cfg.get("timeout_stop", False) else "超时按失败处理"
-            self.append_log(f"<hr><b><font color='blue'>>>> 引擎启动 ({start_key}启动 / {stop_key}停止) - 方案: {self.current_profile_name} - 日志: {self.log_level_combo.currentText()} - 循环: {self.loop_combo.currentText()} - 起始步: {start_step} - 多目标: {multi_info} - {timeout_mode}</font></b>")
+            self.append_log(f"<hr><b><font color='blue'>>>> 引擎启动 ({start_key}启动 / {stop_key}停止) - 方案: {self.current_profile_name} - 日志: {self.log_level_combo.currentText()} - 循环: {self.loop_combo.currentText()} - {loop_range_info} - 起始步: {start_step} - 多目标: {multi_info} - {timeout_mode}</font></b>")
             
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -3697,6 +5632,7 @@ class RPAWindow(QMainWindow):
         self.worker = WorkerThread(self.engine, tasks)
         self.worker.log_signal.connect(self.append_log)
         self.worker.status_signal.connect(self.update_running_status_overlay)
+        self.worker.click_signal.connect(self.show_click_indicator_overlay)
         self.worker.finished_signal.connect(self.on_finish)
         self.worker.start()
 
