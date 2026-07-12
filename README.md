@@ -1,5 +1,5 @@
-# waterRPA-FUKUA
-基于b站up不高兴就喝水的开源软件waterRPA进行了一些修改，增加了大量可自定义功能
+# waterRPA-fukuaRPA
+以b站up不高兴就喝水的开源软件waterRPA为核心进行了彻底重构，增加了大量可自定义功能
 ================================================================
 By:b站浮夸HG
 
@@ -47,7 +47,7 @@ By:b站浮夸HG
 ## 软件界面
 <img width="2550" height="1530" alt="image" src="https://github.com/user-attachments/assets/df3d0a74-41ed-40d7-9770-5942347b8068" />
 
-使用说明：无需安装 Python 环境，解压即用。
+使用说明：无需安装 Python 环境，新电脑也可解压即用。
 bug反馈请到b站私信我，这是我的b站号https://space.bilibili.com/95794432
 
 
