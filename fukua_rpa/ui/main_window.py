@@ -751,6 +751,7 @@ class RPAWindow(QMainWindow):
         dodge_rows.addWidget(dodge_settings_row)
         g_dodge.set_content_layout(dodge_rows)
         settings_content_layout.addWidget(g_dodge)
+        self.advanced_setting_widgets.append(g_dodge)
         
         # 3. 速度控制
         g2 = CollapsibleSection("速度控制 (0为极速)")
@@ -822,7 +823,8 @@ class RPAWindow(QMainWindow):
         settings_content_layout.addWidget(g2)
 
         # 4. 多目标点击
-        g_multi = CollapsibleSection("多目标点击")
+        self.multi_target_section = CollapsibleSection("多目标点击")
+        g_multi = self.multi_target_section
         multi_settings_row = ResponsiveRow()
         self.multi_mode_combo = NoWheelComboBox()
         self.multi_mode_combo.addItems(["快速一个", "全部匹配"])
@@ -843,6 +845,7 @@ class RPAWindow(QMainWindow):
         multi_layout.addWidget(multi_settings_row)
         g_multi.set_content_layout(multi_layout)
         settings_content_layout.addWidget(g_multi)
+        self.advanced_setting_widgets.append(g_multi)
         
         # 5. 系统设置
         g3 = CollapsibleSection("系统设置")
@@ -964,29 +967,32 @@ class RPAWindow(QMainWindow):
         )
         self.start_step_edit = QLineEdit("1")
         self.start_step_edit.setFixedWidth(60)
-        system_settings_row.add_group(
+        self.start_step_group = system_settings_row.add_group(
             "从第", self.start_step_edit, "步开始",
             HelpBtn("【从第X步开始执行】\n默认 1。启动脚本后每轮循环都从这里开始；成功/失败跳至仍按列表中的实际步号计算。")
         )
+        self.advanced_setting_widgets.append(self.start_step_group)
 
         self.loop_start_round_edit = QLineEdit("1")
         self.loop_start_round_edit.setFixedWidth(60)
         self.loop_end_round_edit = QLineEdit("0")
         self.loop_end_round_edit.setFixedWidth(60)
-        system_settings_row.add_group(
+        self.loop_range_group = system_settings_row.add_group(
             "脚本从第", self.loop_start_round_edit, "次循环开始", "到第",
             self.loop_end_round_edit, "次循环停止",
             HelpBtn("【全局循环范围】\n从第几次循环开始真正执行步骤；前面的循环轮次会直接跳过。\n停止循环填 0 表示不限；填 5 表示执行到第 5 次循环后结束。\n这个设置和“从第X步开始”不同：它控制第几轮循环生效。")
         )
+        self.advanced_setting_widgets.append(self.loop_range_group)
 
         self.low_power_ui_chk = QCheckBox("省电UI模式")
         self.low_power_ui_chk.setChecked(True)
         self.low_power_ui_chk.setToolTip("降低主窗口空闲刷新频率：快捷键轮询约 250ms，CPU显示约 3秒刷新一次。可减轻拖动窗口和空闲时的单核占用。")
         self.low_power_ui_chk.stateChanged.connect(self.apply_ui_performance_mode)
-        system_settings_row.add_group(
+        self.low_power_group = system_settings_row.add_group(
             self.low_power_ui_chk,
             HelpBtn("【省电UI模式】\n只影响界面刷新和热键轮询频率，不改变脚本识别逻辑。\n资源监测选择“跟随省电模式”时，也会在 1 秒和 3 秒刷新之间切换。\n如果你感觉热键响应慢，可以关闭。")
         )
+        self.advanced_setting_widgets.append(self.low_power_group)
         self.cpu_refresh_combo = NoWheelComboBox()
         self.cpu_refresh_combo.addItem("跟随省电模式", "auto")
         self.cpu_refresh_combo.addItem("0.5 秒", 500)
@@ -1022,7 +1028,8 @@ class RPAWindow(QMainWindow):
         g3.set_content_layout(gl3_main)
         settings_content_layout.addWidget(g3)
 
-        credential_section = CollapsibleSection("凭据库")
+        self.credential_section = CollapsibleSection("凭据库")
+        credential_section = self.credential_section
         credential_layout = QVBoxLayout()
         credential_row = ResponsiveRow()
         self.credential_combo = NoWheelComboBox()
@@ -1051,6 +1058,7 @@ class RPAWindow(QMainWindow):
         credential_layout.addWidget(credential_note)
         credential_section.set_content_layout(credential_layout)
         settings_content_layout.addWidget(credential_section)
+        self.advanced_setting_widgets.append(credential_section)
         self.refresh_credential_names()
 
         g_map = CollapsibleSection("按键映射")
@@ -1318,7 +1326,21 @@ class RPAWindow(QMainWindow):
                 not self.scene_wake_chk.isChecked(),
                 self.scene_wake_sensitivity_combo.currentData() != "balanced",
                 self.cpu_refresh_combo.currentData() != "auto",
+                self.dodge_chk.isChecked(),
+                self.multi_mode_combo.currentText() != "快速一个",
+                self.start_step_edit.text().strip() != "1",
+                self.loop_start_round_edit.text().strip() != "1",
+                self.loop_end_round_edit.text().strip() not in ("", "0"),
+                not self.low_power_ui_chk.isChecked(),
             )
+        )
+
+    def current_settings_mode(self):
+        combo = getattr(self, "settings_mode_combo", None)
+        return (
+            "advanced"
+            if combo is not None and combo.currentData() == "advanced"
+            else "simple"
         )
 
     def apply_settings_mode(self, _index=None):
@@ -1331,6 +1353,19 @@ class RPAWindow(QMainWindow):
         )
         for widget in getattr(self, "advanced_setting_widgets", []):
             widget.setVisible(advanced)
+        mode = "advanced" if advanced else "simple"
+        task_list = getattr(self, "task_list", None)
+        if task_list is not None:
+            for row_index in range(task_list.count()):
+                row = task_list.itemWidget(task_list.item(row_index))
+                if row is not None and hasattr(row, "set_settings_mode"):
+                    row.set_settings_mode(mode)
+        for dialog in list(getattr(self, "task_config_dialogs", set())):
+            try:
+                if hasattr(dialog, "apply_settings_mode"):
+                    dialog.apply_settings_mode(mode)
+            except RuntimeError:
+                self.task_config_dialogs.discard(dialog)
         notice = getattr(self, "advanced_settings_notice", None)
         if notice is not None:
             notice.setText(
@@ -1827,6 +1862,8 @@ class RPAWindow(QMainWindow):
         if not dialog:
             return
         self.task_config_dialogs.add(dialog)
+        if hasattr(dialog, "apply_settings_mode"):
+            dialog.apply_settings_mode(self.current_settings_mode())
         dialog.destroyed.connect(lambda *_args, d=dialog: self.task_config_dialogs.discard(d))
 
     def unregister_task_config_dialog(self, dialog):
@@ -2469,7 +2506,7 @@ class RPAWindow(QMainWindow):
             title=title,
             auto_close_ms=15000,
             draw_lines=True,
-            detail_text="显示直接坐标点击、悬停、拖拽起终点和点位序列；图片识别点击需运行时识别后才知道位置。",
+            detail_text="显示直接坐标点击、悬停、拖拽起终点和自定义点位；图片识别点击需运行时识别后才知道位置。",
             point_labels=labels,
             line_segments=line_segments
         )
@@ -3669,7 +3706,10 @@ class RPAWindow(QMainWindow):
             self.restoring_history = False
 
     def restore_row_widget(self, item, data):
-        row_widget = TaskRow(delete_callback=self.del_row)
+        row_widget = TaskRow(
+            delete_callback=self.del_row,
+            settings_mode=self.current_settings_mode(),
+        )
         if data:
             row_widget.set_data(data)
         item.setSizeHint(row_widget.sizeHint())
@@ -3690,7 +3730,10 @@ class RPAWindow(QMainWindow):
     def add_row(self, data=None, index=None, record_undo=True, select=True):
         if record_undo:
             self.push_undo_state()
-        row_widget = TaskRow(delete_callback=self.del_row)
+        row_widget = TaskRow(
+            delete_callback=self.del_row,
+            settings_mode=self.current_settings_mode(),
+        )
         if data: row_widget.set_data(data)
         item = QListWidgetItem()
         item.setSizeHint(row_widget.sizeHint())

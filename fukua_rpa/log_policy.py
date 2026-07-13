@@ -34,7 +34,7 @@ LOG_CATEGORY_SPECS = (
     LogCategorySpec(LOG_FLOW, "流程分支与跳转", "成功/失败分支、循环跳转和条件流程"),
     LogCategorySpec(LOG_ACTION, "动作细节", "鼠标、键盘、等待、提醒和变量动作"),
     LogCategorySpec(LOG_RECOGNITION, "识别结果", "目标命中、未命中、倍率和相似度"),
-    LogCategorySpec(LOG_COORDINATES, "坐标与点位", "实际坐标、点位序列和偏移状态"),
+    LogCategorySpec(LOG_COORDINATES, "坐标与点位", "实际坐标、自定义点位和偏移状态"),
     LogCategorySpec(LOG_PARAMETERS, "运行与步骤参数", "完全调试使用的配置和步骤参数快照"),
     LogCategorySpec(LOG_TIMING, "耗时与性能", "识别、截图、匹配、点击和总体性能"),
     LogCategorySpec(LOG_BACKEND, "底层核心、缓存与回退", "原生 DLL、OpenCV、截图后端和缓存状态"),

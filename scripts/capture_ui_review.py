@@ -37,7 +37,7 @@ def main() -> None:
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=ROOT / ".scratch" / "ui-review-v1.0.11",
+        default=ROOT / ".scratch" / "ui-review-v1.0.12",
     )
     args = parser.parse_args()
     output_dir = args.output_dir.resolve()

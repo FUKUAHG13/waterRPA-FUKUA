@@ -1,8 +1,8 @@
 """Product identity, compatibility baseline, and defensive resource limits."""
 
 PRODUCT_NAME = "fukuaRPA"
-APP_VERSION = "v1.0.11"
-BUILD_NAME = "fukuaRPA_v1.0.11"
+APP_VERSION = "v1.0.12"
+BUILD_NAME = "fukuaRPA_v1.0.12"
 ONEFILE_BUILD_NAME = f"{BUILD_NAME}_single"
 NATIVE_CORE_DLL_NAME = "fukua_rpa_core.dll"
 SUPPORTED_WINDOWS_TEXT = "Windows 10 1809 及以上版本（仅 x64）和 Windows 11"

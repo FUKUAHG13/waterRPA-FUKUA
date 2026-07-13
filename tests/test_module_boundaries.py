@@ -78,8 +78,8 @@ class ModuleBoundaryTests(unittest.TestCase):
 
     def test_product_identity_is_consistent(self):
         self.assertEqual(PRODUCT_NAME, "fukuaRPA")
-        self.assertEqual(APP_VERSION, "v1.0.11")
-        self.assertEqual(BUILD_NAME, "fukuaRPA_v1.0.11")
+        self.assertEqual(APP_VERSION, "v1.0.12")
+        self.assertEqual(BUILD_NAME, "fukuaRPA_v1.0.12")
 
     def test_config_store_reads_new_and_legacy_backup_formats(self):
         profile = {"默认方案": {"tasks": [], "key_mappings": []}}

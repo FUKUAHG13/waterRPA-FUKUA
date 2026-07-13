@@ -1,4 +1,4 @@
-# fukuaRPA v1.0.11
+# fukuaRPA v1.0.12
 
 ## 支持范围
 
@@ -114,8 +114,8 @@ python scripts\build_release.py --format onefile
 python scripts\build_release.py --format all
 ```
 
-多文件目录名固定为 `fukuaRPA_v1.0.11`，单文件名固定为
-`fukuaRPA_v1.0.11_single.exe`。两者来自同一套完整版源码、功能和质量门，项目不再包含或生成精简版。
+多文件目录名固定为 `fukuaRPA_v1.0.12`，单文件名固定为
+`fukuaRPA_v1.0.12_single.exe`。两者来自同一套完整版源码、功能和质量门，项目不再包含或生成精简版。
 多文件版启动更快、发布物料和程序文件可逐项校验，作为推荐版本；单文件版便于携带，但首次启动和
 每次冷启动需要解压内置运行库，因此更慢，也更容易触发杀毒软件的启发式检查。
 同一解压目录只能运行一个实例；如需并行运行互不影响的配置，可以复制到不同目录。

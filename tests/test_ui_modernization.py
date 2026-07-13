@@ -92,6 +92,121 @@ class ModernUiTests(unittest.TestCase):
             self.app.processEvents()
             self.assertTrue(all(not widget.isHidden() for widget in window.advanced_setting_widgets))
 
+    def test_requested_settings_groups_are_advanced_only(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self.create_window(temp_dir)
+            advanced_widgets = (
+                window.dodge_section,
+                window.multi_target_section,
+                window.credential_section,
+                window.start_step_group,
+                window.loop_range_group,
+                window.low_power_group,
+            )
+            self.assertTrue(all(widget.isHidden() for widget in advanced_widgets))
+
+            window.settings_mode_combo.setCurrentIndex(
+                window.settings_mode_combo.findData("advanced")
+            )
+            self.app.processEvents()
+            self.assertTrue(all(not widget.isHidden() for widget in advanced_widgets))
+
+    def test_command_picker_filters_advanced_actions_without_changing_old_steps(self):
+        advanced_commands = {
+            "右键拖拽",
+            "鼠标悬停",
+            "设置变量",
+            "判断表达式",
+            "等待窗口",
+            "激活窗口",
+            "关闭窗口",
+            "输入秘密文本",
+            "点击窗口控件",
+            "设置控件文本",
+            "读取控件文本",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            window = self.create_window(temp_dir)
+            window.add_row({"type": 1.0, "value": "10,20"})
+            simple_row = window.task_list.itemWidget(window.task_list.item(0))
+            simple_options = {
+                simple_row.type_combo.itemText(index)
+                for index in range(simple_row.type_combo.count())
+            }
+            self.assertTrue(advanced_commands.isdisjoint(simple_options))
+            self.assertIn("启动程序", simple_options)
+            self.assertIn("直到条件成立", simple_options)
+
+            window.add_row({"type": 16.0, "value": "count = 1"})
+            existing_row = window.task_list.itemWidget(window.task_list.item(1))
+            self.assertEqual(existing_row.type_combo.currentText(), "设置变量")
+            self.assertEqual(existing_row.get_data()["type"], 16.0)
+            preserved_options = {
+                existing_row.type_combo.itemText(index)
+                for index in range(existing_row.type_combo.count())
+            }
+            self.assertIn("设置变量", preserved_options)
+            self.assertNotIn("判断表达式", preserved_options)
+
+            window.settings_mode_combo.setCurrentIndex(
+                window.settings_mode_combo.findData("advanced")
+            )
+            self.app.processEvents()
+            advanced_options = {
+                existing_row.type_combo.itemText(index)
+                for index in range(existing_row.type_combo.count())
+            }
+            self.assertTrue(advanced_commands.issubset(advanced_options))
+
+            window.settings_mode_combo.setCurrentIndex(
+                window.settings_mode_combo.findData("simple")
+            )
+            self.app.processEvents()
+            self.assertEqual(existing_row.type_combo.currentText(), "设置变量")
+            self.assertEqual(existing_row.get_data()["type"], 16.0)
+
+    def test_step_dialog_moves_requested_controls_to_advanced_mode(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            dialog = TaskConfigDialog(
+                None,
+                {
+                    "coord_step_en": True,
+                    "coord_step_direction": "向下",
+                },
+                coordinate_step_available=True,
+                base_coordinate=(100, 100),
+                base_dir=temp_dir,
+                settings_mode="simple",
+            )
+            self.addCleanup(dialog.close)
+            self.assertFalse(dialog.control_form.isRowVisible(dialog.step_loop_row))
+            self.assertFalse(dialog.control_form.isRowVisible(dialog.coord_reset_row))
+            self.assertFalse(dialog.control_form.isRowVisible(dialog.run_max_row))
+            self.assertEqual(dialog.coord_step_direction_combo.currentText(), "向下")
+            self.assertFalse(dialog.coord_step_direction_combo.isEnabled())
+            self.assertEqual(
+                dialog.control_form.labelForField(dialog.coord_sequence_box).text(),
+                "自定义点位:",
+            )
+
+            dialog.apply_settings_mode("advanced")
+            self.assertTrue(dialog.control_form.isRowVisible(dialog.step_loop_row))
+            self.assertTrue(dialog.control_form.isRowVisible(dialog.coord_reset_row))
+            self.assertTrue(dialog.control_form.isRowVisible(dialog.run_max_row))
+            directions = {
+                dialog.coord_step_direction_combo.itemText(index)
+                for index in range(dialog.coord_step_direction_combo.count())
+            }
+            self.assertEqual(directions, set(TaskConfigDialog.COORD_STEP_DIRECTIONS))
+            self.assertTrue(dialog.coord_step_direction_combo.isEnabled())
+
+            dialog.coord_step_chk.setChecked(False)
+            dialog.apply_settings_mode("simple")
+            self.assertEqual(dialog.coord_step_direction_combo.count(), 1)
+            self.assertEqual(
+                dialog.coord_step_direction_combo.currentText(), "移动到新点位"
+            )
+
     def test_task_value_edit_participates_in_undo_history(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             window = self.create_window(temp_dir)

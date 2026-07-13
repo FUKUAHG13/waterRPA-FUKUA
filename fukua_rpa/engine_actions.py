@@ -149,11 +149,11 @@ class ActionExecutionMixin:
                     seq_point, seq_state, seq_status = self._coord_sequence_location(step_info, coord_sequence_config)
                     if seq_status == "done":
                         if self.log_level >= 1:
-                            self.log("<font color='gray'>    -> 自定义点位序列已点完，本步骤按设置跳过。</font>", LOG_COORDINATES)
+                            self.log("<font color='gray'>    -> 自定义点位已全部执行，本步骤按设置跳过。</font>", LOG_COORDINATES)
                         return "skipped"
                     if not seq_point:
                         if self.log_level >= 1:
-                            self.log("<font color='orange'>    -> 自定义点位序列为空，已跳过本步骤。</font>", LOG_COORDINATES)
+                            self.log("<font color='orange'>    -> 自定义点位为空，已跳过本步骤。</font>", LOG_COORDINATES)
                         return "skipped"
                     coord_state = None
                     locations = [(seq_point[0], seq_point[1], 1.0, 1.0)]

@@ -70,7 +70,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn(f"{APP_VERSION.removeprefix('v')}.0", version_info)
         self.assertIn(f"{BUILD_NAME}.exe", version_info)
         self.assertIn(f"{ONEFILE_BUILD_NAME}.exe", onefile_version_info)
-        self.assertEqual(APP_VERSION, "v1.0.11")
+        self.assertEqual(APP_VERSION, "v1.0.12")
 
     def test_release_builder_defaults_to_complete_onedir(self):
         script = (ROOT / "scripts" / "build_release.py").read_text(

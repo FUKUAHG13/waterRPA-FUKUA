@@ -1,4 +1,4 @@
-"""fukuaRPA v1.0.11 application entry point.
+"""fukuaRPA v1.0.12 application entry point.
 
 Implementation lives in the ``fukua_rpa`` package. This file intentionally keeps
 only process setup, a small compatibility export surface, and application startup.

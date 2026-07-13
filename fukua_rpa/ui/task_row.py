@@ -63,7 +63,7 @@ class RefreshableHoverButton(QPushButton):
 
 
 class TaskRow(QFrame):
-    def __init__(self, delete_callback):
+    def __init__(self, delete_callback, settings_mode="simple"):
         super().__init__()
         self.setObjectName("taskRow")
         self.setMinimumHeight(42)
@@ -72,6 +72,9 @@ class TaskRow(QFrame):
         self._value_edit_original = ""
         self._type_edit_snapshot = None
         self._type_edit_original = ""
+        self.settings_mode = (
+            "advanced" if str(settings_mode) == "advanced" else "simple"
+        )
         self.custom_data = {
             "step_id": "",
             "custom_en": False,
@@ -155,7 +158,9 @@ class TaskRow(QFrame):
         self.layout.addWidget(self.breakpoint_mark_label)
         
         self.type_combo = NoWheelComboBox()
-        self.type_combo.addItems(command_names())
+        self.type_combo.addItems(
+            command_names(include_advanced=self.settings_mode == "advanced")
+        )
         self.type_combo.setMinimumWidth(130)
         self.type_combo.currentTextChanged.connect(self.on_type_changed)
         self.type_combo.activated.connect(self.finish_type_history)
@@ -202,6 +207,22 @@ class TaskRow(QFrame):
         self.del_btn.clicked.connect(lambda: delete_callback(self))
         self.layout.addWidget(self.del_btn)
         
+        self.on_type_changed(self.type_combo.currentText())
+
+    def set_settings_mode(self, mode):
+        mode = "advanced" if str(mode) == "advanced" else "simple"
+        current_name = self.type_combo.currentText()
+        options = command_names(
+            include_advanced=mode == "advanced",
+            preserve_names=(current_name,),
+        )
+        self.settings_mode = mode
+        self.type_combo.blockSignals(True)
+        self.type_combo.clear()
+        self.type_combo.addItems(options)
+        if current_name in options:
+            self.type_combo.setCurrentText(current_name)
+        self.type_combo.blockSignals(False)
         self.on_type_changed(self.type_combo.currentText())
 
     def task_snapshot(self):
@@ -472,6 +493,11 @@ class TaskRow(QFrame):
             self.current_step_index(),
             self.type_combo.currentText(),
             getattr(main_window, "base_dir", None),
+            settings_mode=(
+                main_window.current_settings_mode()
+                if hasattr(main_window, "current_settings_mode")
+                else "simple"
+            ),
         )
         self.config_dialog = dialog
         dialog.accepted.connect(lambda d=dialog: self.apply_custom_config(d))
@@ -706,7 +732,18 @@ class TaskRow(QFrame):
         
         t = data.get("type", 1.0)
         if t in COMMAND_BY_CODE:
-            self.type_combo.setCurrentText(COMMAND_BY_CODE[t].name)
+            command_name = COMMAND_BY_CODE[t].name
+            if self.type_combo.findText(command_name) < 0:
+                self.type_combo.blockSignals(True)
+                self.type_combo.clear()
+                self.type_combo.addItems(
+                    command_names(
+                        include_advanced=self.settings_mode == "advanced",
+                        preserve_names=(command_name,),
+                    )
+                )
+                self.type_combo.blockSignals(False)
+            self.type_combo.setCurrentText(command_name)
 
     def select_file(self):
         cmd_type = self.get_data()["type"]

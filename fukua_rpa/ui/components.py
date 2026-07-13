@@ -517,7 +517,32 @@ class ImageClickPointDialog(QDialog):
         return self.image_widget.rx, self.image_widget.ry
 
 class TaskConfigDialog(QDialog):
-    def __init__(self, parent, data, image_settings_available=True, point_limit_available=False, coordinate_step_available=False, base_coordinate=None, image_path="", image_click_point_available=False, base_coordinate_changed=None, step_index=None, step_type="", base_dir=None):
+    COORD_STEP_DIRECTIONS = (
+        "向上",
+        "向下",
+        "向左",
+        "向右",
+        "自定义偏移",
+        "移动到新点位",
+    )
+    SIMPLE_COORD_STEP_DIRECTIONS = ("移动到新点位",)
+
+    def __init__(
+        self,
+        parent,
+        data,
+        image_settings_available=True,
+        point_limit_available=False,
+        coordinate_step_available=False,
+        base_coordinate=None,
+        image_path="",
+        image_click_point_available=False,
+        base_coordinate_changed=None,
+        step_index=None,
+        step_type="",
+        base_dir=None,
+        settings_mode=None,
+    ):
         super().__init__(None)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         self.setWindowFlag(Qt.Window, True)
@@ -541,6 +566,15 @@ class TaskConfigDialog(QDialog):
         self.coord_step_clearing_due_to_count = False
         settings_dir = os.path.abspath(base_dir or get_base_dir())
         self.dialog_settings = QSettings(os.path.join(settings_dir, "config.ini"), QSettings.IniFormat)
+        saved_settings_mode = (
+            settings_mode
+            if settings_mode is not None
+            else self.dialog_settings.value("settings_view_mode", "simple")
+        )
+        self.settings_mode = (
+            "advanced" if str(saved_settings_mode) == "advanced" else "simple"
+        )
+        self._coord_direction_locked_for_simple = False
         self.update_window_title()
         self.setMinimumSize(900, 520)
         outer_layout = QVBoxLayout(self)
@@ -734,6 +768,7 @@ class TaskConfigDialog(QDialog):
         control_form.setHorizontalSpacing(10)
         control_form.setVerticalSpacing(7)
         control_form.setLabelAlignment(Qt.AlignRight | Qt.AlignTop)
+        self.control_form = control_form
 
         self.repeat_combo = NoWheelComboBox()
         self.repeat_combo.addItems(["执行一次", "指定次数", "无限重复"])
@@ -839,7 +874,7 @@ class TaskConfigDialog(QDialog):
         self.coord_step_every_edit.setToolTip("每执行本坐标点击步骤多少次后，移动到下一个点击位置。")
 
         self.coord_step_direction_combo = NoWheelComboBox()
-        self.coord_step_direction_combo.addItems(["向上", "向下", "向左", "向右", "自定义偏移", "移动到新点位"])
+        self.coord_step_direction_combo.addItems(self.COORD_STEP_DIRECTIONS)
         fit_combo_to_contents(self.coord_step_direction_combo)
         self.coord_step_direction_combo.setCurrentText(str(data.get("coord_step_direction", "向下")))
         self.coord_step_direction_combo.currentTextChanged.connect(self.update_coord_step_ui)
@@ -918,7 +953,7 @@ class TaskConfigDialog(QDialog):
             HelpBtn("【手动修正点】\n预览中单独拖动中间点会保存手动修正。修改路径点数时会自动清除，避免旧坐标错位。")
         )
 
-        self.coord_sequence_chk = QCheckBox("启用自定义点位序列")
+        self.coord_sequence_chk = QCheckBox("启用自定义点位")
         self.coord_sequence_chk.setChecked(config_bool(data.get("coord_sequence_en", False)) and self.coordinate_step_available)
         self.coord_sequence_chk.setEnabled(self.coordinate_step_available)
         self.coord_sequence_chk.setToolTip("仅对直接输入坐标的点击步骤生效。开启后会按列表中的点位依次点击，坐标步进会自动忽略。")
@@ -945,7 +980,7 @@ class TaskConfigDialog(QDialog):
         coord_sequence_top = ResponsiveRow()
         coord_sequence_top.add_group(
             self.coord_sequence_chk,
-            HelpBtn("【自定义点位序列】\n只对直接坐标点击生效。每次执行到本步骤时按列表顺序取下一个坐标，坐标步进会自动忽略。")
+            HelpBtn("【自定义点位】\n只对直接坐标点击生效。每次执行到本步骤时按列表顺序取下一个坐标，坐标步进会自动忽略。")
         )
         coord_sequence_controls = ResponsiveRow()
         coord_sequence_controls.add_group("结束后:", self.coord_sequence_end_combo)
@@ -1071,6 +1106,7 @@ class TaskConfigDialog(QDialog):
             (HelpBtn("【本步骤重复】\n可执行一次、指定次数或无限重复。指定次数时在右侧填写本步骤连续执行的次数。"),),
         ))
         control_form.addRow("循环范围:", step_loop_row)
+        self.step_loop_row = step_loop_row
         control_form.addRow("同点点击上限:", inline_row(
             (self.point_limit_chk,),
             ("次数", self.point_limit_count_edit),
@@ -1083,17 +1119,20 @@ class TaskConfigDialog(QDialog):
         control_form.addRow("目标点位:", coord_point_row)
         control_form.addRow("移动上限:", coord_limit_row)
         control_form.addRow("重置循环:", coord_reset_row)
+        self.coord_reset_row = coord_reset_row
         control_form.addRow("手动修正:", coord_manual_row)
-        control_form.addRow("点位序列:", coord_sequence_box)
+        control_form.addRow("自定义点位:", coord_sequence_box)
         control_form.addRow("失败处理:", inline_row(
             ("连续失败", self.fail_limit_edit),
             (self.no_skip_wait_chk,),
             (HelpBtn("【失败处理】\n连续失败次数决定何时放弃本步骤；开启禁止跳过后，会优先一直重试到成功或单步超时。"),),
         ))
-        control_form.addRow("本次运行上限:", inline_row(
+        run_max_row = inline_row(
             (self.run_max_executions_edit, "次后跳过"),
             (HelpBtn("【本次运行最多执行】\n只在当前这次启动脚本期间计数，手动停止并重新启动后清零。\n达到上限后，本步骤视为跳过，不触发成功/失败跳转，也不会执行本步骤内的重复次数。填 0 表示不限。"),),
-        ))
+        )
+        control_form.addRow("本次运行上限:", run_max_row)
+        self.run_max_row = run_max_row
         control_form.addRow("成功分支:", inline_row(
             ("跳过", self.success_skip_edit), ("跳至", self.success_jump_edit),
             (HelpBtn("【成功分支】\n跳至填 0 表示关闭；同一结果中“跳至”优先于“跳过”。"),),
@@ -1103,10 +1142,10 @@ class TaskConfigDialog(QDialog):
             (HelpBtn("【失败分支】\n达到连续失败次数后执行。跳至填 0 表示关闭；“跳至”优先于“跳过”。"),),
         ))
 
-        control_note = QLabel("跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。循环范围只控制本步骤在哪些脚本循环轮次生效，被范围跳过不会触发成功/失败分支。开启禁止跳过后，连续失败次数暂不生效，失败分支会等到成功或超时后再处理。移动到新点位时，“移动上限”表示起点到目标点之间的总点位数；“重置循环”可让本路径点击指定次数后回到起点。")
-        control_note.setProperty("role", "muted")
-        control_note.setWordWrap(True)
-        control_form.addRow("", control_note)
+        self.control_note = QLabel("")
+        self.control_note.setProperty("role", "muted")
+        self.control_note.setWordWrap(True)
+        control_form.addRow("", self.control_note)
         layout.addWidget(control_box)
 
         self.debug_section = CollapsibleSection(
@@ -1159,12 +1198,7 @@ class TaskConfigDialog(QDialog):
         debug_form.addRow("", debug_note)
         self.debug_section.set_content_layout(debug_form)
         layout.addWidget(self.debug_section)
-        settings_mode = str(
-            self.dialog_settings.value("settings_view_mode", "simple") or "simple"
-        )
-        self.debug_section.setVisible(
-            settings_mode == "advanced" or self.debug_breakpoint_chk.isChecked()
-        )
+        self.apply_settings_mode(self.settings_mode)
 
         self.update_repeat_ui()
         self.update_debug_preset_ui()
@@ -1190,6 +1224,56 @@ class TaskConfigDialog(QDialog):
         else:
             self.resize(980, 650)
         self.update_context_note()
+
+    def apply_settings_mode(self, mode):
+        self.settings_mode = (
+            "advanced" if str(mode) == "advanced" else "simple"
+        )
+        advanced = self.settings_mode == "advanced"
+        for row in (
+            self.step_loop_row,
+            self.coord_reset_row,
+            self.run_max_row,
+        ):
+            self.control_form.setRowVisible(row, advanced)
+        self._refresh_coord_step_direction_options(advanced)
+        self.debug_section.setVisible(
+            advanced or self.debug_breakpoint_chk.isChecked()
+        )
+        self.control_note.setText(
+            "跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。循环范围只控制本步骤在哪些脚本循环轮次生效，被范围跳过不会触发成功/失败分支。开启禁止跳过后，连续失败次数暂不生效，失败分支会等到成功或超时后再处理。移动到新点位时，“移动上限”表示起点到目标点之间的总点位数；“重置循环”可让本路径点击指定次数后回到起点。"
+            if advanced
+            else "跳至填 0 表示关闭；同一结果里“跳至”优先于“跳过”。开启禁止跳过后，连续失败次数暂不生效，失败分支会等到成功或超时后再处理。移动到新点位时，“移动上限”表示起点到目标点之间的总点位数。"
+        )
+        self.update_coord_step_ui()
+
+    def _refresh_coord_step_direction_options(self, advanced):
+        combo = self.coord_step_direction_combo
+        current = combo.currentText() or "移动到新点位"
+        self._coord_direction_locked_for_simple = False
+        if advanced:
+            options = list(self.COORD_STEP_DIRECTIONS)
+        elif (
+            current not in self.SIMPLE_COORD_STEP_DIRECTIONS
+            and self.coord_step_chk.isChecked()
+        ):
+            # Existing advanced paths must remain intact when merely viewed in
+            # simple mode. The value stays visible but becomes read-only.
+            options = [current]
+            self._coord_direction_locked_for_simple = True
+        else:
+            options = list(self.SIMPLE_COORD_STEP_DIRECTIONS)
+            current = options[0]
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(options)
+        combo.setCurrentText(current if current in options else options[0])
+        combo.blockSignals(False)
+        combo.setToolTip(
+            "当前步骤正在使用高级步进方向；切换到高级模式后才能修改。"
+            if self._coord_direction_locked_for_simple
+            else ""
+        )
 
     def update_window_title(self):
         if self.step_index:
@@ -1477,6 +1561,9 @@ class TaskConfigDialog(QDialog):
             self.coord_step_reset_after_edit, self.coord_step_pick_btn, self.coord_step_preview_btn
         ]:
             widget.setEnabled(enabled)
+        self.coord_step_direction_combo.setEnabled(
+            enabled and not self._coord_direction_locked_for_simple
+        )
         self.coord_step_distance_edit.setEnabled(enabled and direction in ["向上", "向下", "向左", "向右"])
         self.coord_step_dx_edit.setEnabled(enabled and direction == "自定义偏移")
         self.coord_step_dy_edit.setEnabled(enabled and direction == "自定义偏移")
@@ -1498,7 +1585,7 @@ class TaskConfigDialog(QDialog):
         ]:
             widget.setEnabled(enabled)
         if enabled:
-            self.coord_step_chk.setToolTip("已启用自定义点位序列，坐标步进会自动忽略。关闭点位序列后可继续使用坐标步进。")
+            self.coord_step_chk.setToolTip("已启用自定义点位，坐标步进会自动忽略。关闭自定义点位后可继续使用坐标步进。")
         else:
             self.coord_step_chk.setToolTip("仅对直接输入坐标的点击步骤生效；图片识别点击会自动忽略。")
         self.coord_sequence_box.updateGeometry()
@@ -1532,8 +1619,8 @@ class TaskConfigDialog(QDialog):
         labels = [str(i + 1) for i in range(len(points))]
         self.coord_step_preview = CoordinateStepPreviewOverlay(
             points,
-            {"direction": "自定义点位序列"},
-            title=f"自定义点位序列预览：{len(points)} 个点",
+            {"direction": "自定义点位"},
+            title=f"自定义点位预览：{len(points)} 个点",
             detail_text="实际执行每次只点击当前序号的点；再次执行本步骤才进入下一个点。",
             auto_close_ms=0,
             point_labels=labels

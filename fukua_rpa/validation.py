@@ -219,15 +219,15 @@ class TaskListValidator:
 
         if coord_sequence_en:
             if task_type not in (1.0, 2.0, 3.0) or not coordinate:
-                return f"第 {step_no} 步小齿轮里的'自定义点位序列'仅能用于直接坐标的左键/右键点击步骤。"
+                return f"第 {step_no} 步小齿轮里的'自定义点位'仅能用于直接坐标的左键/右键点击步骤。"
             if coord_sequence_end_action not in (
                 "点完后跳过本步",
                 "点完后停在最后一个",
                 "点完后循环",
             ):
-                return f"第 {step_no} 步小齿轮里的'点位序列结束后'设置无效！\n填入内容: {coord_sequence_end_action}"
+                return f"第 {step_no} 步小齿轮里的'自定义点位结束后'设置无效！\n填入内容: {coord_sequence_end_action}"
             if not parse_coordinate_sequence(coord_sequence_points):
-                return f"第 {step_no} 步小齿轮里的'自定义点位序列'至少要包含一个 x,y 坐标！\n填入内容: {coord_sequence_points}"
+                return f"第 {step_no} 步小齿轮里的'自定义点位'至少要包含一个 x,y 坐标！\n填入内容: {coord_sequence_points}"
 
         if task_type == TASK_TYPE_UNTIL:
             return self._validate_until_task(
