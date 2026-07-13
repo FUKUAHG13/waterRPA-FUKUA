@@ -1,3 +1,28 @@
+"""
+waterRPA 完整版维护说明
+
+重构前最终归档版本：浮夸改 v2.0.1。后续主线由 fukuaRPA 接替，
+本文件仅保留用于历史查阅、复现和必要的旧方案维护。
+
+支持基线：Windows 10 1809+ x64 与 Windows 11；不再以 Windows 7 为兼容目标。
+
+本文件目前同时包含四层职责：
+1. Win32/坐标/配置辅助函数，以及全局键鼠钩子。
+2. NativeVisionCore：可选 C++ DLL 适配层。返回 None 表示 DLL 未处理成功，
+   返回空列表表示 DLL 已完成搜索但没有命中，这两种结果不能混为一谈。
+3. RPAEngine：唯一允许执行脚本步骤、截图识别和真实键鼠操作的核心。
+   每次运行必须先 reserve_run()，并由同一个 run_id 在 finally 中 finish_run()；
+   stop() 只发停止请求，不能提前把 is_running 改为 False。
+4. RPAWindow/各类 QWidget：只负责采集配置和显示状态。耗时识别必须留在
+   WorkerThread，工作线程不得直接操作 Qt 控件，只能通过 Signal/回调通知界面。
+
+坐标约定：脚本、配置和识别引擎保存的是 Windows 虚拟桌面的物理像素坐标；
+全屏覆盖层使用 ScreenCoordinateMapper 在 Qt 逻辑坐标与物理坐标之间转换。
+
+新增配置字段时，至少同步检查默认配置、TaskRow 的 set_data/get_data、配置导入、
+运行前验证、执行引擎和全量导出的图片路径重写，避免字段只在界面或引擎单边生效。
+"""
+
 import sys
 import os
 import time
@@ -12,6 +37,7 @@ import hashlib
 import webbrowser
 import zipfile
 import shutil
+import math
 from ctypes import wintypes
 
 # ---------------------------------------------------------
@@ -30,13 +56,11 @@ from PySide6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                                QFileDialog, QTextEdit, QMessageBox, QFrame, QCheckBox, QGroupBox, QToolTip,
                                QListWidget, QListWidgetItem, QAbstractItemView, QInputDialog, QSplitter,
                                QDialog, QDialogButtonBox, QFormLayout)
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QSettings, QPoint
-from PySide6.QtGui import QCursor, QFont, QColor, QPalette, QBrush, QPen, QPainter, QRegion, QDrag, QPixmap
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QRect, QSettings, QPoint
+from PySide6.QtGui import QCursor, QFont, QColor, QPen, QPainter, QDrag, QPixmap
 import pyperclip
 from PIL import Image, ImageChops, ImageStat
 import pyautogui
-
-SLIM_BUILD = True
 
 try:
     import mss
@@ -66,7 +90,22 @@ TASK_TYPE_UNTIL = 15.0
 UNTIL_CONDITION_MODES = ["图片出现", "图片消失", "区域发生变化", "区域变成指定图片"]
 UNTIL_CONDITION_LOGICS = ["全部满足", "任一满足"]
 UNTIL_LIMIT_ACTIONS = ["继续下一步", "停止脚本", "按失败处理"]
-APP_VERSION = "v2.0"
+APP_VERSION = "v2.0.1"
+SUPPORTED_WINDOWS_TEXT = "Windows 10 1809 及以上版本（仅 x64）和 Windows 11"
+NATIVE_CORE_MIN_VERSION = 10400
+NATIVE_CORE_MAX_VERSION = 19999
+
+MAX_PROFILES = 100
+MAX_TASKS_PER_PROFILE = 5000
+MAX_KEY_MAPPINGS = 256
+MAX_SCALES_PER_TEMPLATE = 61
+MAX_TEMPLATE_SOURCE_PIXELS = 25_000_000
+MAX_TEMPLATE_CACHE_BYTES = 512 * 1024 * 1024
+MAX_SINGLE_TEMPLATE_CACHE_BYTES = 128 * 1024 * 1024
+MAX_CLICK_INDICATOR_OVERLAYS = 24
+MAX_PACKAGE_FILES = 5000
+MAX_PACKAGE_FILE_BYTES = 256 * 1024 * 1024
+MAX_PACKAGE_TOTAL_BYTES = 1024 * 1024 * 1024
 
 # ---------------------------------------------------------
 # 底层 Hook 结构体、按键映射与 64位指针强制安全声明
@@ -142,6 +181,7 @@ WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
 WM_RBUTTONDBLCLK = 0x0206
+PM_NOREMOVE = 0x0000
 MK_LBUTTON = 0x0001
 MK_RBUTTON = 0x0002
 GA_ROOT = 2
@@ -185,8 +225,28 @@ try:
     user32.GetAncestor.restype = wintypes.HWND
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
     user32.GetWindowRect.restype = wintypes.BOOL
+    user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(RECT)]
+    user32.GetClientRect.restype = wintypes.BOOL
     user32.IsWindowVisible.argtypes = [wintypes.HWND]
     user32.IsWindowVisible.restype = wintypes.BOOL
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
+    user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(POINT)]
+    user32.ClientToScreen.restype = wintypes.BOOL
+    user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetClassNameW.restype = ctypes.c_int
+    user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+    user32.GetWindowTextLengthW.restype = ctypes.c_int
+    user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.GetWindowTextW.restype = ctypes.c_int
+    user32.GetDlgCtrlID.argtypes = [wintypes.HWND]
+    user32.GetDlgCtrlID.restype = ctypes.c_int
+    user32.GetDlgItem.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32.GetDlgItem.restype = wintypes.HWND
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.EnumWindows.restype = wintypes.BOOL
     user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
     user32.EnumChildWindows.restype = wintypes.BOOL
 except:
@@ -221,12 +281,146 @@ kernel32.GetCurrentThreadId.argtypes = []
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
 user32.GetMessageW.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
 user32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.TranslateMessage.restype = wintypes.BOOL
 user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.DispatchMessageW.restype = LRESULT
 user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
 user32.PostThreadMessageW.restype = wintypes.BOOL
+
+class MONITORINFOEXW(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", RECT),
+        ("rcWork", RECT),
+        ("dwFlags", wintypes.DWORD),
+        ("szDevice", wintypes.WCHAR * 32),
+    ]
+
+MONITORENUMPROC = ctypes.WINFUNCTYPE(
+    wintypes.BOOL,
+    wintypes.HANDLE,
+    wintypes.HDC,
+    ctypes.POINTER(RECT),
+    wintypes.LPARAM,
+)
+
+try:
+    user32.EnumDisplayMonitors.argtypes = [wintypes.HDC, ctypes.POINTER(RECT), MONITORENUMPROC, wintypes.LPARAM]
+    user32.EnumDisplayMonitors.restype = wintypes.BOOL
+    user32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(MONITORINFOEXW)]
+    user32.GetMonitorInfoW.restype = wintypes.BOOL
+except Exception:
+    pass
+
+class ScreenCoordinateMapper:
+    def __init__(self):
+        self.screens = list(QApplication.screens())
+        self.virtual_rect = QRect()
+        for screen in self.screens:
+            rect = screen.geometry()
+            self.virtual_rect = QRect(rect) if self.virtual_rect.isNull() else self.virtual_rect.united(rect)
+        if self.virtual_rect.isNull():
+            self.virtual_rect = QApplication.primaryScreen().virtualGeometry()
+
+        physical_by_name = {item["name"].upper(): item for item in self._physical_monitors()}
+        unused = list(physical_by_name.values())
+        self.entries = []
+        for screen in self.screens:
+            name = str(screen.name()).upper()
+            physical = physical_by_name.get(name)
+            if physical in unused:
+                unused.remove(physical)
+            if physical is None and unused:
+                physical = min(
+                    unused,
+                    key=lambda item: abs(item["width"] - screen.geometry().width() * screen.devicePixelRatio())
+                    + abs(item["height"] - screen.geometry().height() * screen.devicePixelRatio()),
+                )
+                unused.remove(physical)
+            if physical is None:
+                rect = screen.geometry()
+                ratio = max(0.01, float(screen.devicePixelRatio()))
+                physical = {
+                    "name": name,
+                    "left": int(round(rect.x() * ratio)),
+                    "top": int(round(rect.y() * ratio)),
+                    "width": max(1, int(round(rect.width() * ratio))),
+                    "height": max(1, int(round(rect.height() * ratio))),
+                }
+            self.entries.append({"logical": QRect(screen.geometry()), "physical": physical})
+
+    def _physical_monitors(self):
+        monitors = []
+
+        def enum_proc(hmonitor, _hdc, _rect, _data):
+            info = MONITORINFOEXW()
+            info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+            if user32.GetMonitorInfoW(hmonitor, ctypes.byref(info)):
+                rect = info.rcMonitor
+                monitors.append({
+                    "name": str(info.szDevice),
+                    "left": int(rect.left),
+                    "top": int(rect.top),
+                    "width": max(1, int(rect.right - rect.left)),
+                    "height": max(1, int(rect.bottom - rect.top)),
+                })
+            return True
+
+        try:
+            callback = MONITORENUMPROC(enum_proc)
+            user32.EnumDisplayMonitors(None, None, callback, 0)
+        except Exception:
+            return []
+        return monitors
+
+    def apply_to(self, widget):
+        widget.setGeometry(self.virtual_rect)
+
+    def _entry_for_physical(self, x, y):
+        for entry in self.entries:
+            rect = entry["physical"]
+            if rect["left"] <= x < rect["left"] + rect["width"] and rect["top"] <= y < rect["top"] + rect["height"]:
+                return entry
+        return self.entries[0] if self.entries else None
+
+    def _entry_for_logical(self, x, y):
+        point = QPoint(int(round(x)), int(round(y)))
+        for entry in self.entries:
+            if entry["logical"].contains(point):
+                return entry
+        return self.entries[0] if self.entries else None
+
+    def physical_to_local(self, x, y):
+        entry = self._entry_for_physical(float(x), float(y))
+        if entry is None:
+            return QPoint(int(round(x)), int(round(y)))
+        logical = entry["logical"]
+        physical = entry["physical"]
+        gx = logical.x() + (float(x) - physical["left"]) * logical.width() / physical["width"]
+        gy = logical.y() + (float(y) - physical["top"]) * logical.height() / physical["height"]
+        return QPoint(int(round(gx - self.virtual_rect.x())), int(round(gy - self.virtual_rect.y())))
+
+    def local_to_physical(self, point):
+        gx = float(point.x() + self.virtual_rect.x())
+        gy = float(point.y() + self.virtual_rect.y())
+        entry = self._entry_for_logical(gx, gy)
+        if entry is None:
+            return int(round(gx)), int(round(gy))
+        logical = entry["logical"]
+        physical = entry["physical"]
+        px = physical["left"] + (gx - logical.x()) * physical["width"] / max(1, logical.width())
+        py = physical["top"] + (gy - logical.y()) * physical["height"] / max(1, logical.height())
+        return int(round(px)), int(round(py))
+
+    def local_rect_to_physical(self, rect):
+        first = self.local_to_physical(rect.topLeft())
+        last = self.local_to_physical(QPoint(rect.x() + rect.width(), rect.y() + rect.height()))
+        left, right = sorted((first[0], last[0]))
+        top, bottom = sorted((first[1], last[1]))
+        return left, top, max(1, right - left), max(1, bottom - top)
 
 # ---------------------------------------------------------
 # 全局配置与异步日志系统
@@ -258,6 +452,82 @@ def parse_float_text(value, default=0.0):
         return float(str(value).strip())
     except:
         return default
+
+def build_scale_values(min_scale, max_scale, scale_step, max_count=MAX_SCALES_PER_TEMPLATE):
+    """Return the extra scale variants; the original 1.0 template is searched separately."""
+    min_scale = float(min_scale)
+    max_scale = float(max_scale)
+    scale_step = float(scale_step)
+    if not all(math.isfinite(v) for v in (min_scale, max_scale, scale_step)):
+        raise ValueError("缩放参数必须是有限数字")
+    if min_scale <= 0 or max_scale <= 0:
+        raise ValueError("缩放范围必须大于 0")
+    if max_scale < min_scale:
+        raise ValueError("最大缩放不能小于最小缩放")
+    if scale_step <= 0:
+        raise ValueError("缩放步长必须大于 0")
+
+    values = []
+    scale = min_scale
+    guard = 0
+    while scale <= max_scale + scale_step * 0.25:
+        if not (0.99 < scale < 1.01):
+            values.append(float(round(scale, 8)))
+        guard += 1
+        if 1 + len(values) > max_count or guard > max_count * 2:
+            raise ValueError(f"单张图片最多允许 {max_count} 个缩放档位（包含原始 1.0 倍）")
+        scale = min_scale + guard * scale_step
+    return values
+
+def template_detail_status(image_path, use_gray=True, min_stddev=1.0):
+    """Reject tiny/flat templates that make normalized correlation report arbitrary matches."""
+    try:
+        with Image.open(image_path) as source:
+            width, height = source.size
+            if width < 3 or height < 3:
+                return False, "模板尺寸至少需要 3×3 像素"
+            if width * height > MAX_TEMPLATE_SOURCE_PIXELS:
+                return False, f"模板像素过多，最多允许 {MAX_TEMPLATE_SOURCE_PIXELS:,} 像素"
+            mode = "L" if use_gray else "RGB"
+            sample = source.convert(mode)
+            sample.thumbnail((512, 512))
+            stddev = ImageStat.Stat(sample).stddev
+            detail = max(float(v) for v in stddev) if stddev else 0.0
+            if not math.isfinite(detail) or detail < float(min_stddev):
+                return False, "图片几乎是纯色或缺少纹理，无法安全识别；请扩大截图并包含更多独特细节"
+            return True, ""
+    except Exception as e:
+        return False, f"无法读取模板图片：{e}"
+
+def estimate_template_cache_bytes(image_path, use_gray, scale_values):
+    try:
+        with Image.open(image_path) as source:
+            width, height = source.size
+    except Exception as e:
+        raise ValueError(f"无法读取模板图片：{e}") from e
+    if width * height > MAX_TEMPLATE_SOURCE_PIXELS:
+        raise ValueError(f"模板像素过多，最多允许 {MAX_TEMPLATE_SOURCE_PIXELS:,} 像素")
+    channels = 1 if use_gray else 3
+    estimated = width * height * channels
+    for scale in scale_values:
+        estimated += max(1, int(round(width * scale))) * max(1, int(round(height * scale))) * channels
+    return int(estimated)
+
+def atomic_write_json(path, data):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temp_path = f"{path}.tmp.{os.getpid()}.{threading.get_ident()}"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
 
 def parse_region_text(value):
     try:
@@ -563,6 +833,7 @@ def current_keyboard_hotkey_text(vk):
 def make_mouse_lparam(x, y):
     return wintypes.LPARAM(((int(y) & 0xFFFF) << 16) | (int(x) & 0xFFFF))
 
+# 下列乱码方向名只用于兼容早期版本曾写坏编码的配置；完成显式配置迁移前不要删除。
 def coord_step_delta_values(direction, distance, dx, dy):
     direction = str(direction)
     if direction in ("\u5411\u4e0a", "鍚戜笂"):
@@ -712,6 +983,10 @@ class NativeVisionCore:
                 ]
                 dll.wrpa_find_template.restype = ctypes.c_int
                 self.version = int(dll.wrpa_version())
+                if not (NATIVE_CORE_MIN_VERSION <= self.version <= NATIVE_CORE_MAX_VERSION):
+                    raise RuntimeError(
+                        f"DLL接口版本不兼容：{self.version}，需要 {NATIVE_CORE_MIN_VERSION}-{NATIVE_CORE_MAX_VERSION}"
+                    )
                 self.dll = dll
                 self.available = True
                 self.load_error = ""
@@ -760,6 +1035,7 @@ class NativeVisionCore:
             if rc < 0:
                 self.load_error = err_buf.value or f"native rc {rc}"
                 return None
+            self.load_error = ""
             result = []
             for idx in range(max(0, min(out_count.value, max_matches))):
                 item = out_array[idx]
@@ -1025,7 +1301,7 @@ class TaskConfigDialog(QDialog):
         layout.addWidget(self.context_note)
 
         self.enable_chk = QCheckBox("✓ 为当前图片指令启用独立识别参数")
-        self.enable_chk.setChecked(data.get("custom_en", False))
+        self.enable_chk.setChecked(config_bool(data.get("custom_en", False)))
         self.enable_chk.setStyleSheet("font-weight: bold; color: #E91E63;")
         layout.addWidget(self.enable_chk)
         
@@ -1042,7 +1318,7 @@ class TaskConfigDialog(QDialog):
         for edit in [self.conf_edit, self.s_min_edit, self.s_max_edit, self.s_step_edit]:
             edit.setFixedWidth(72)
         self.gray_chk = QCheckBox("灰度匹配 (取消则严格区分颜色)")
-        self.gray_chk.setChecked(data.get("custom_gray", True))
+        self.gray_chk.setChecked(config_bool(data.get("custom_gray", True)))
         
         form.addRow("识别参数:", inline_row(
             "相似度", self.conf_edit,
@@ -1056,16 +1332,6 @@ class TaskConfigDialog(QDialog):
         self.enable_chk.setEnabled(self.image_settings_available)
         self.form_widget.setEnabled(self.image_settings_available and self.enable_chk.isChecked())
         self.enable_chk.toggled.connect(self.update_image_settings_enabled)
-        if SLIM_BUILD:
-            self.enable_chk.setChecked(False)
-            self.enable_chk.setEnabled(False)
-            self.conf_edit.setText("0.8")
-            self.s_min_edit.setText("1.0")
-            self.s_max_edit.setText("1.0")
-            self.s_step_edit.setText("0.05")
-            self.gray_chk.setChecked(False)
-            self.form_widget.setEnabled(False)
-            self.enable_chk.setToolTip("精简版已移除独立缩放/灰度识别参数；图片步骤会按原图原尺寸匹配。")
 
         until_defaults = until_condition_defaults()
         until_defaults.update(data or {})
@@ -1955,12 +2221,12 @@ class TaskConfigDialog(QDialog):
 
     def get_data(self):
         data = {
-            "custom_en": False if SLIM_BUILD else (self.enable_chk.isChecked() and self.image_settings_available),
+            "custom_en": self.enable_chk.isChecked() and self.image_settings_available,
             "custom_conf": self.conf_edit.text(),
             "custom_scale_min": self.s_min_edit.text(),
             "custom_scale_max": self.s_max_edit.text(),
             "custom_scale_step": self.s_step_edit.text(),
-            "custom_gray": False if SLIM_BUILD else self.gray_chk.isChecked(),
+            "custom_gray": self.gray_chk.isChecked(),
             "repeat_mode": self.repeat_combo.currentText(),
             "repeat_count": self.repeat_count_edit.text(),
             "step_loop_start": self.step_loop_start_edit.text(),
@@ -2062,14 +2328,8 @@ class RegionWindow(QWidget):
         self.setMouseTracking(True)
         self.multi = multi
         
-        virtual_rect = QApplication.primaryScreen().virtualGeometry()
-        self.setGeometry(virtual_rect)
-        
-        phys_w, phys_h = pyautogui.size()
-        log_w = virtual_rect.width()
-        log_h = virtual_rect.height()
-        self.scale_x = phys_w / log_w
-        self.scale_y = phys_h / log_h
+        self.screen_mapper = ScreenCoordinateMapper()
+        self.screen_mapper.apply_to(self)
         
         self.start_point = None
         self.end_point = None
@@ -2085,12 +2345,7 @@ class RegionWindow(QWidget):
         return regions
 
     def physical_rect(self, rect):
-        return (
-            int(rect.x() * self.scale_x),
-            int(rect.y() * self.scale_y),
-            int(rect.width() * self.scale_x),
-            int(rect.height() * self.scale_y)
-        )
+        return self.screen_mapper.local_rect_to_physical(rect)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -2107,8 +2362,7 @@ class RegionWindow(QWidget):
             painter.setBrush(QColor(0, 255, 0, 35))
             for idx, rect in enumerate(regions, 1):
                 painter.drawRect(rect)
-                real_w = int(rect.width() * self.scale_x)
-                real_h = int(rect.height() * self.scale_y)
+                _real_x, _real_y, real_w, real_h = self.physical_rect(rect)
                 prefix = f"区域{idx}: " if self.multi else "选区:"
                 info_text = f"{prefix}{rect.width()}x{rect.height()} (实际: {real_w}x{real_h})"
                 painter.setPen(QColor(255, 255, 255))
@@ -2123,9 +2377,9 @@ class RegionWindow(QWidget):
             painter.setPen(QColor(255, 255, 255))
             painter.setFont(QFont("Arial", 16, QFont.Bold))
             if self.multi:
-                hint = f"左键拖拽添加多个小区域 | 右键完成 | 区域相近时建议框成一个大矩形 | 缩放比: {self.scale_x:.2f}"
+                hint = "左键拖拽添加多个小区域 | 右键完成 | 区域相近时建议框成一个大矩形"
             else:
-                hint = f"请框选区域 | 右键取消 | 缩放比: {self.scale_x:.2f}"
+                hint = "请框选区域 | 右键取消"
             fm = painter.fontMetrics()
             tw = fm.horizontalAdvance(hint)
             painter.drawText((self.width() - tw)//2, 100, hint)
@@ -2180,20 +2434,17 @@ class MultiPointPickerUI(QWidget):
         self.setCursor(Qt.CrossCursor)
         self.setMouseTracking(True)
 
-        virtual_rect = QApplication.primaryScreen().virtualGeometry()
-        self.setGeometry(virtual_rect)
-        phys_w, phys_h = pyautogui.size()
-        self.scale_x = phys_w / max(1, virtual_rect.width())
-        self.scale_y = phys_h / max(1, virtual_rect.height())
+        self.screen_mapper = ScreenCoordinateMapper()
+        self.screen_mapper.apply_to(self)
         self.show()
         self.raise_()
         self.activateWindow()
 
     def logical_to_physical(self, point):
-        return int(point.x() * self.scale_x), int(point.y() * self.scale_y)
+        return self.screen_mapper.local_to_physical(point)
 
     def physical_to_logical(self, x, y):
-        return QPoint(int(x / self.scale_x), int(y / self.scale_y))
+        return self.screen_mapper.physical_to_local(x, y)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -2295,31 +2546,43 @@ class KeyMappingHookThread(QThread):
         self.thread_id = None
         self.keyboard_hook = None
         self.pressed_vks = set()
+        self.stop_event = threading.Event()
+        self.ready_event = threading.Event()
 
     def run(self):
         self.thread_id = kernel32.GetCurrentThreadId()
-        self.is_active = True
-        self.kb_pointer = HOOKPROC(self.keyboard_handler)
-        self.keyboard_hook = user32.SetWindowsHookExW(13, self.kb_pointer, kernel32.GetModuleHandleW(None), 0)
-        if not self.keyboard_hook:
-            self.is_active = False
+        msg = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_NOREMOVE)
+        if self.stop_event.is_set():
+            self.ready_event.set()
             return
 
-        msg = wintypes.MSG()
-        while self.is_active and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
-        if getattr(self, "keyboard_hook", None):
-            user32.UnhookWindowsHookEx(self.keyboard_hook)
-            self.keyboard_hook = None
+        try:
+            self.kb_pointer = HOOKPROC(self.keyboard_handler)
+            self.keyboard_hook = user32.SetWindowsHookExW(13, self.kb_pointer, kernel32.GetModuleHandleW(None), 0)
+            if not self.keyboard_hook:
+                return
+            self.is_active = True
+            self.ready_event.set()
+            while not self.stop_event.is_set() and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self.is_active = False
+            self.ready_event.set()
+            if getattr(self, "keyboard_hook", None):
+                user32.UnhookWindowsHookEx(self.keyboard_hook)
+                self.keyboard_hook = None
 
     def stop(self):
+        self.stop_event.set()
         self.is_active = False
         if getattr(self, "thread_id", None):
             user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
 
     def keyboard_handler(self, nCode, wParam, lParam):
+        if self.stop_event.is_set():
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
         if nCode >= 0:
             struct = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             vk = int(struct.vkCode)
@@ -2342,6 +2605,14 @@ class KeyMappingHookThread(QThread):
 # --------------------------
 class HookThread(QThread):
     finished_signal = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.stop_event = threading.Event()
+        self.thread_id = None
+        self.is_active = False
+        self.mouse_hook = None
+        self.keyboard_hook = None
     
     def run(self):
         self.events = []
@@ -2351,28 +2622,41 @@ class HookThread(QThread):
         self.r_down_time = 0
         
         self.thread_id = kernel32.GetCurrentThreadId()
-        self.is_active = True
-        
-        self.mouse_pointer = HOOKPROC(self.mouse_handler)
-        self.mouse_hook = user32.SetWindowsHookExW(14, self.mouse_pointer, kernel32.GetModuleHandleW(None), 0)
-        
-        self.kb_pointer = HOOKPROC(self.keyboard_handler)
-        self.keyboard_hook = user32.SetWindowsHookExW(13, self.kb_pointer, kernel32.GetModuleHandleW(None), 0)
-        
         msg = wintypes.MSG()
-        while self.is_active and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-            
-        if getattr(self, 'mouse_hook', None): user32.UnhookWindowsHookEx(self.mouse_hook)
-        if getattr(self, 'keyboard_hook', None): user32.UnhookWindowsHookEx(self.keyboard_hook)
-        self.finished_signal.emit(self.events)
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_NOREMOVE)
+        if self.stop_event.is_set():
+            self.finished_signal.emit(self.events)
+            return
+        try:
+            self.mouse_pointer = HOOKPROC(self.mouse_handler)
+            self.mouse_hook = user32.SetWindowsHookExW(14, self.mouse_pointer, kernel32.GetModuleHandleW(None), 0)
+            self.kb_pointer = HOOKPROC(self.keyboard_handler)
+            self.keyboard_hook = user32.SetWindowsHookExW(13, self.kb_pointer, kernel32.GetModuleHandleW(None), 0)
+            if not self.mouse_hook or not self.keyboard_hook:
+                return
+            self.is_active = True
+            while not self.stop_event.is_set() and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self.is_active = False
+            if getattr(self, 'mouse_hook', None):
+                user32.UnhookWindowsHookEx(self.mouse_hook)
+                self.mouse_hook = None
+            if getattr(self, 'keyboard_hook', None):
+                user32.UnhookWindowsHookEx(self.keyboard_hook)
+                self.keyboard_hook = None
+            self.finished_signal.emit(self.events)
 
     def stop(self):
+        self.stop_event.set()
         self.is_active = False
-        user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)
+        if self.thread_id:
+            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
 
     def mouse_handler(self, nCode, wParam, lParam):
+        if self.stop_event.is_set():
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
         if nCode >= 0:
             struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             x, y = struct.pt.x, struct.pt.y
@@ -2407,6 +2691,8 @@ class HookThread(QThread):
         return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
     def keyboard_handler(self, nCode, wParam, lParam):
+        if self.stop_event.is_set():
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
         if nCode >= 0:
             struct = ctypes.cast(lParam, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
             if wParam == 0x0100 or wParam == 0x0104: 
@@ -2422,6 +2708,7 @@ class RecorderUI(QWidget):
         self.main_window = main_window
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_DeleteOnClose)
         self.resize(320, 80)
         
         rect = QApplication.primaryScreen().geometry()
@@ -2443,6 +2730,8 @@ class RecorderUI(QWidget):
         self.hook_thread = None
         self.f8_pressed = False
         self.esc_pressed = False
+        self.cancelled = False
+        self.result_handled = False
         
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_keys)
@@ -2468,6 +2757,8 @@ class RecorderUI(QWidget):
             self.f8_pressed = False
 
     def start_recording(self):
+        self.cancelled = False
+        self.result_handled = False
         self.state = 1
         self.label.setText("🔴 正在全息录制 (键鼠监控中)...\n[F8] 停止并生成 | [ESC] 放弃录制")
         self.bg.setStyleSheet("background-color: rgba(40, 10, 10, 230); border-radius: 10px; border: 2px solid #FF1744;")
@@ -2482,13 +2773,18 @@ class RecorderUI(QWidget):
             self.hook_thread.stop()
             
     def abort(self):
+        self.cancelled = True
+        self.result_handled = True
         if self.hook_thread:
             self.hook_thread.stop()
-            self.hook_thread.wait()
+            self.hook_thread.wait(1500)
         self.main_window.showNormal()
         self.close()
 
     def on_recorded(self, events):
+        if self.cancelled or self.result_handled:
+            return
+        self.result_handled = True
         tasks = []
         last_time = None
         for t, e_type, val in events:
@@ -2516,6 +2812,20 @@ class RecorderUI(QWidget):
         self.main_window.showNormal()
         self.close()
 
+    def closeEvent(self, event):
+        self.timer.stop()
+        if self.state != 2 and not self.result_handled:
+            self.cancelled = True
+            self.result_handled = True
+        if self.hook_thread and self.hook_thread.isRunning():
+            self.hook_thread.stop()
+            if not self.hook_thread.wait(1500):
+                write_log("录制钩子仍在停止中，暂缓关闭录制窗口。")
+                event.ignore()
+                QTimer.singleShot(100, self.close)
+                return
+        event.accept()
+
 class CoordinatePickThread(QThread):
     pos_signal = Signal(int, int)
     done_signal = Signal(str)
@@ -2526,26 +2836,36 @@ class CoordinatePickThread(QThread):
         self.mode = mode
         self.is_active = False
         self.down_pos = None
+        self.thread_id = None
+        self.mouse_hook = None
+        self.stop_event = threading.Event()
 
     def run(self):
         self.thread_id = kernel32.GetCurrentThreadId()
-        self.is_active = True
-
-        self.mouse_pointer = HOOKPROC(self.mouse_handler)
-        self.mouse_hook = user32.SetWindowsHookExW(14, self.mouse_pointer, kernel32.GetModuleHandleW(None), 0)
-
         msg = wintypes.MSG()
-        while self.is_active and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
-
-        if getattr(self, 'mouse_hook', None):
-            user32.UnhookWindowsHookEx(self.mouse_hook)
+        user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, PM_NOREMOVE)
+        if self.stop_event.is_set():
+            return
+        try:
+            self.mouse_pointer = HOOKPROC(self.mouse_handler)
+            self.mouse_hook = user32.SetWindowsHookExW(14, self.mouse_pointer, kernel32.GetModuleHandleW(None), 0)
+            if not self.mouse_hook:
+                return
+            self.is_active = True
+            while not self.stop_event.is_set() and user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            self.is_active = False
+            if getattr(self, 'mouse_hook', None):
+                user32.UnhookWindowsHookEx(self.mouse_hook)
+                self.mouse_hook = None
 
     def stop(self):
+        self.stop_event.set()
         self.is_active = False
         if getattr(self, 'thread_id', None):
-            user32.PostThreadMessageW(self.thread_id, 0x0012, 0, 0)
+            user32.PostThreadMessageW(self.thread_id, WM_QUIT, 0, 0)
 
     def finish_with_value(self, value):
         self.done_signal.emit(value)
@@ -2556,6 +2876,8 @@ class CoordinatePickThread(QThread):
         self.stop()
 
     def mouse_handler(self, nCode, wParam, lParam):
+        if self.stop_event.is_set():
+            return user32.CallNextHookEx(None, nCode, wParam, lParam)
         if nCode >= 0:
             struct = ctypes.cast(lParam, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
             x, y = struct.pt.x, struct.pt.y
@@ -2640,7 +2962,11 @@ class CoordinatePickerUI(QWidget):
     def closeEvent(self, event):
         if getattr(self, 'pick_thread', None) and self.pick_thread.isRunning():
             self.pick_thread.stop()
-            self.pick_thread.wait(500)
+            if not self.pick_thread.wait(1500):
+                write_log("坐标选取钩子仍在停止中，暂缓关闭选取窗口。")
+                event.ignore()
+                QTimer.singleShot(100, self.close)
+                return
         event.accept()
 
 class CoordinateStepPreviewOverlay(QWidget):
@@ -2665,11 +2991,8 @@ class CoordinateStepPreviewOverlay(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setCursor(Qt.PointingHandCursor)
 
-        virtual_rect = QApplication.primaryScreen().virtualGeometry()
-        self.setGeometry(virtual_rect)
-        phys_w, phys_h = pyautogui.size()
-        self.scale_x = phys_w / max(1, virtual_rect.width())
-        self.scale_y = phys_h / max(1, virtual_rect.height())
+        self.screen_mapper = ScreenCoordinateMapper()
+        self.screen_mapper.apply_to(self)
 
         if self.auto_close_ms > 0:
             QTimer.singleShot(self.auto_close_ms, self.close)
@@ -2679,7 +3002,7 @@ class CoordinateStepPreviewOverlay(QWidget):
         self.setFocus()
 
     def to_screen_point(self, x, y):
-        return QPoint(int(x / self.scale_x), int(y / self.scale_y))
+        return self.screen_mapper.physical_to_local(x, y)
 
     def set_points(self, points):
         self.points = [(float(x), float(y)) for x, y in points]
@@ -2690,7 +3013,7 @@ class CoordinateStepPreviewOverlay(QWidget):
         self.update()
 
     def from_screen_point(self, point):
-        return int(round(point.x() * self.scale_x)), int(round(point.y() * self.scale_y))
+        return self.screen_mapper.local_to_physical(point)
 
     def nearest_editable_index(self, pos):
         if not self.editable_indices or not self.points:
@@ -2945,17 +3268,14 @@ class ClickPointOverlay(QWidget):
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_DeleteOnClose)
 
-        virtual_rect = QApplication.primaryScreen().virtualGeometry()
-        self.setGeometry(virtual_rect)
-        phys_w, phys_h = pyautogui.size()
-        self.scale_x = phys_w / max(1, virtual_rect.width())
-        self.scale_y = phys_h / max(1, virtual_rect.height())
+        self.screen_mapper = ScreenCoordinateMapper()
+        self.screen_mapper.apply_to(self)
         QTimer.singleShot(max(200, int(duration_ms)), self.close)
         self.show()
         self.raise_()
 
     def to_screen_point(self):
-        return QPoint(int(self.x / self.scale_x), int(self.y / self.scale_y))
+        return self.screen_mapper.physical_to_local(self.x, self.y)
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -3036,10 +3356,13 @@ class RPAEngine:
     def __init__(self):
         self.is_running = False
         self.stop_requested = False
+        self._run_lock = threading.Lock()
+        self._run_sequence = 0
+        self._active_run_id = None
         self.min_scale = 1.0
         self.max_scale = 1.0
         self.scale_step = 0.05
-        self.enable_grayscale = False if SLIM_BUILD else True
+        self.enable_grayscale = True
         self.confidence = 0.8
         self.scan_region = None 
         self.scan_regions = []
@@ -3058,13 +3381,13 @@ class RPAEngine:
         self.detect_delay = 0.0
         self.adaptive_backoff = True
         self.show_click_indicator = True
-        self.use_native_core = False if SLIM_BUILD else True
+        self.use_native_core = True
         self.use_fast_screenshot = True
         self.playback_speed = 1.0
         self.start_step_index = 0
         self.loop_start_round = 1
         self.loop_end_round = 0
-        self.multi_target_mode = "最佳一个"
+        self.multi_target_mode = "快速一个"
         self.multi_target_order = "从上到下"
         self.loop_mode = "单次"
         self.loop_val = 1.0
@@ -3077,7 +3400,7 @@ class RPAEngine:
         self.callback_status = None
         self.callback_click_indicator = None
         self.opencv_available = False 
-        self.native_core = None if SLIM_BUILD else NativeVisionCore()
+        self.native_core = NativeVisionCore()
         self.native_core_logged = False
         self.img_cache = {} 
         self.scaled_templates_cache = {}
@@ -3092,10 +3415,14 @@ class RPAEngine:
         self.miss_streaks = {}
         self.last_target_positions = {}
         self._mss_instance = None
+        self.template_validation_cache = {}
+        self.template_validation_reported = set()
+        self.scaled_template_cache_bytes = 0
+        self.global_deadline = None
+        self.time_limit_reached = False
 
         self.check_engine_status()
-        if not SLIM_BUILD:
-            self._log_native_core_status()
+        self._log_native_core_status()
         self.set_high_priority()
 
     def set_high_priority(self):
@@ -3106,10 +3433,6 @@ class RPAEngine:
         except: pass
 
     def check_engine_status(self):
-        if SLIM_BUILD:
-            self.opencv_available = False
-            write_log("精简版已禁用 OpenCV/NumPy 识别核心。")
-            return
         try:
             import cv2
             import numpy
@@ -3122,16 +3445,47 @@ class RPAEngine:
             write_log("OpenCV 引擎不可用。")
 
     def _log_native_core_status(self):
-        if SLIM_BUILD:
-            return
         if self.native_core.available:
             write_log(f"Native vision core ready (v{self.native_core.version}).")
         else:
             write_log(f"Native vision core unavailable, fallback enabled: {self.native_core.load_error}")
 
+    def reserve_run(self):
+        with self._run_lock:
+            if self.is_running:
+                return None
+            self._run_sequence += 1
+            self._active_run_id = self._run_sequence
+            self.is_running = True
+            self.stop_requested = False
+            return self._active_run_id
+
+    def active_run_matches(self, run_id):
+        with self._run_lock:
+            return self.is_running and self._active_run_id == run_id
+
+    def finish_run(self, run_id):
+        with self._run_lock:
+            if self._active_run_id != run_id:
+                return False
+            self.is_running = False
+            self.stop_requested = False
+            self._active_run_id = None
+            self.global_deadline = None
+            self.time_limit_reached = False
+            return True
+
     def stop(self):
         self.stop_requested = True
-        self.is_running = False
+
+    def close_screenshot_backend(self):
+        instance = self._mss_instance
+        self._mss_instance = None
+        if instance is not None:
+            try:
+                instance.close()
+            except Exception:
+                pass
 
     def log(self, msg):
         write_log(msg, self.callback_msg)
@@ -3172,28 +3526,52 @@ class RPAEngine:
             return default
 
     def check_stop_flag(self):
-        return self.stop_requested
+        return self.stop_requested or self.global_time_limit_reached()
+
+    def global_time_limit_reached(self):
+        deadline = self.global_deadline
+        if deadline is None or time.monotonic() < deadline:
+            return False
+        if not self.time_limit_reached:
+            self.time_limit_reached = True
+            if self.log_level >= 0:
+                self.log("<font color='green'>>>> 提示: 已达到指定运行时间，任务正常结束</font>")
+        return True
+
+    def configure_global_deadline(self):
+        units = {
+            "指定时间(时)": 3600.0,
+            "指定时间(分)": 60.0,
+            "指定时间(秒)": 1.0,
+        }
+        multiplier = units.get(self.loop_mode)
+        self.time_limit_reached = False
+        if multiplier is None:
+            self.global_deadline = None
+            return
+        duration = max(0.0, float(self.loop_val)) * multiplier
+        self.global_deadline = time.monotonic() + duration
 
     def wait_recognition_interval(self, extra_delay=0.0):
         wait_time = max(0.0, self.detect_delay + max(0.0, extra_delay))
         if wait_time <= 0:
-            return True
-        end_time = time.time() + wait_time
-        while time.time() < end_time:
+            return not self.check_stop_flag()
+        end_time = time.monotonic() + wait_time
+        while time.monotonic() < end_time:
             if self.check_stop_flag():
                 return False
-            time.sleep(min(0.05, max(0.0, end_time - time.time())))
+            time.sleep(min(0.05, max(0.0, end_time - time.monotonic())))
         return True
 
     def wait_step_interval(self):
         wait_time = max(0.0, float(self.settlement_wait or 0.0))
         if wait_time <= 0:
-            return True
-        end_time = time.time() + wait_time
-        while time.time() < end_time:
+            return not self.check_stop_flag()
+        end_time = time.monotonic() + wait_time
+        while time.monotonic() < end_time:
             if self.check_stop_flag():
                 return False
-            time.sleep(min(0.05, max(0.0, end_time - time.time())))
+            time.sleep(min(0.05, max(0.0, end_time - time.monotonic())))
         return True
 
     def is_wait_command(self, cmd):
@@ -3213,10 +3591,54 @@ class RPAEngine:
             return False
         return True
 
+    def task_exhausted_for_run(self, task, step_no):
+        run_max = self.non_negative_int_value(task.get("run_max_executions", 0), 0)
+        if run_max > 0 and self.step_execution_counts.get(int(step_no), 0) >= run_max:
+            return True
+
+        if self.as_bool(task.get("coord_sequence_en", False)):
+            end_action = str(task.get("coord_sequence_end_action", "点完后跳过本步"))
+            if end_action == "点完后跳过本步":
+                points = parse_coordinate_sequence(task.get("coord_sequence_points", ""))
+                state = self.coord_sequence_states.get(int(step_no))
+                if points and state and int(state.get("index", 0)) >= len(points):
+                    return True
+        return False
+
+    def task_runnable_in_loop(self, task, step_no, loop_count):
+        return self.task_active_in_loop(task, loop_count) and not self.task_exhausted_for_run(task, step_no)
+
+    def loop_number_allowed(self, loop_count):
+        if self.loop_end_round > 0 and loop_count > self.loop_end_round:
+            return False
+        if self.loop_mode == "单次" and loop_count > 1:
+            return False
+        if self.loop_mode == "指定次数" and loop_count > self.loop_val:
+            return False
+        return True
+
+    def next_runnable_loop(self, tasks, after_loop):
+        if self.loop_mode == "单次":
+            return None
+        start_idx = min(max(int(getattr(self, "start_step_index", 0)), 0), max(len(tasks) - 1, 0))
+        candidates = []
+        for idx in range(start_idx, len(tasks)):
+            task = tasks[idx]
+            if self.task_exhausted_for_run(task, idx + 1):
+                continue
+            step_start = self.positive_int_value(task.get("step_loop_start", 1), 1)
+            step_end = self.non_negative_int_value(task.get("step_loop_end", 0), 0)
+            candidate = max(int(after_loop) + 1, self.loop_start_round, step_start)
+            if step_end > 0 and candidate > step_end:
+                continue
+            if self.loop_number_allowed(candidate):
+                candidates.append(candidate)
+        return min(candidates) if candidates else None
+
     def next_interval_task(self, tasks, next_idx, loop_count):
         for look_idx in range(max(0, int(next_idx)), len(tasks)):
             task = tasks[look_idx]
-            if self.task_active_in_loop(task, loop_count):
+            if self.task_runnable_in_loop(task, look_idx + 1, loop_count):
                 return task
 
         next_loop = loop_count + 1
@@ -3227,7 +3649,7 @@ class RPAEngine:
         start_idx = min(max(int(getattr(self, "start_step_index", 0)), 0), max(len(tasks) - 1, 0))
         for look_idx in range(start_idx, len(tasks)):
             task = tasks[look_idx]
-            if self.task_active_in_loop(task, next_loop):
+            if self.task_runnable_in_loop(task, look_idx + 1, next_loop):
                 return task
         return None
 
@@ -3296,6 +3718,7 @@ class RPAEngine:
             except Exception as e:
                 if self.log_level >= 2:
                     self.log(f"<font color='orange'>    [截图] mss快速截图失败，已回退到pyautogui: {e}</font>")
+                self.close_screenshot_backend()
 
         screenshot_pil = pyautogui.screenshot(region=region)
         offset_x = region[0] if region else 0
@@ -3390,6 +3813,24 @@ class RPAEngine:
             pass
         return (80, 80)
 
+    def matching_template_status(self, img_path, use_gray):
+        path = os.path.abspath(str(img_path or ""))
+        try:
+            stat = os.stat(path)
+            signature = (path, bool(use_gray), int(stat.st_mtime_ns), int(stat.st_size))
+        except OSError:
+            return False, "图片不存在"
+        cached = self.template_validation_cache.get(signature)
+        if cached is None:
+            cached = template_detail_status(path, use_gray)
+            self.template_validation_cache[signature] = cached
+        valid, reason = cached
+        if not valid and signature not in self.template_validation_reported:
+            self.template_validation_reported.add(signature)
+            if self.log_level >= 0:
+                self.log(f"<font color='red'>模板无法安全识别：{os.path.basename(path)}；{reason}</font>")
+        return valid, reason
+
     def image_click_point_options(self, task):
         if not task or not self.as_bool(task.get("image_click_point_en", False)):
             return None
@@ -3449,8 +3890,6 @@ class RPAEngine:
         return self.clip_region_to_bounds(region, bounds)
 
     def scale_options_for(self, cache_key):
-        if SLIM_BUILD:
-            return (1.0, 1.0, 0.05)
         return self.scale_options_cache.get(str(cache_key), (self.min_scale, self.max_scale, self.scale_step))
 
     def native_search_regions(self, quick_region=None, search_regions=None):
@@ -3467,8 +3906,6 @@ class RPAEngine:
         return []
 
     def native_find_targets(self, img_path, cache_key, task_conf, use_gray, find_all=False, quick_region=None, search_regions=None):
-        if SLIM_BUILD:
-            return None
         if not self.use_native_core:
             return None
         if not getattr(self, "native_core", None) or not self.native_core.available:
@@ -3476,6 +3913,9 @@ class RPAEngine:
         path = str(img_path)
         if not path or ',' in path or not os.path.exists(path):
             return None
+        valid, _reason = self.matching_template_status(path, use_gray)
+        if not valid:
+            return []
         if self.check_stop_flag():
             return None
 
@@ -3499,58 +3939,86 @@ class RPAEngine:
         return [(x, y, scale, score) for x, y, scale, score, _radius in matches]
 
     def load_and_precompute(self, tasks):
-        if not self.opencv_available: return
-        try:
-            import cv2
-            import numpy as np
-            write_log("正在预加载资源...")
+        if not self.opencv_available:
+            return True
 
-            def preload_one(path, cache_key, s_min, s_max, s_step, use_gray):
-                if not path or not os.path.exists(path) or ',' in path:
-                    return
-                img = Image.open(path)
-                img.load()
-                self.img_cache[path] = img
+        import cv2
+        import numpy as np
 
+        errors = []
+        write_log("正在预加载资源...")
+
+        def load_source_image(path):
+            if path in self.img_cache:
+                return self.img_cache[path]
+            with Image.open(path) as source:
+                width, height = source.size
+                if width * height > MAX_TEMPLATE_SOURCE_PIXELS:
+                    raise ValueError(f"图片像素过多，最多允许 {MAX_TEMPLATE_SOURCE_PIXELS:,} 像素")
+                image = source.copy()
+                image.load()
+            self.img_cache[path] = image
+            return image
+
+        def preload_one(path, cache_key, s_min, s_max, s_step, use_gray):
+            if not path or not os.path.exists(path) or ',' in path:
+                return
+            valid, reason = self.matching_template_status(path, use_gray)
+            if not valid:
+                raise ValueError(reason)
+
+            scale_values = build_scale_values(s_min, s_max, s_step)
+            estimated = estimate_template_cache_bytes(path, use_gray, scale_values)
+            if estimated > MAX_SINGLE_TEMPLATE_CACHE_BYTES:
+                raise ValueError(
+                    f"该图片预计占用 {estimated / 1024 / 1024:.1f} MB 模板缓存，"
+                    f"单图上限为 {MAX_SINGLE_TEMPLATE_CACHE_BYTES / 1024 / 1024:.0f} MB"
+                )
+            if cache_key in self.scaled_templates_cache:
                 self.scale_options_cache[str(cache_key)] = (s_min, s_max, s_step)
-                if s_min != 1.0 or s_max != 1.0:
-                    if cache_key not in self.scaled_templates_cache:
-                        work_img = img
-                        if use_gray:
-                            if work_img.mode != 'L': work_img = work_img.convert('L')
-                            template = np.array(work_img)
-                        else:
-                            if work_img.mode != 'RGB': work_img = work_img.convert('RGB')
-                            template = cv2.cvtColor(np.array(work_img), cv2.COLOR_RGB2BGR)
+                return
+            if self.scaled_template_cache_bytes + estimated > MAX_TEMPLATE_CACHE_BYTES:
+                raise ValueError(
+                    f"全部模板预计超过 {MAX_TEMPLATE_CACHE_BYTES / 1024 / 1024:.0f} MB 缓存上限，"
+                    "请减少图片、缩放范围或缩放档位"
+                )
 
-                        templates_list = []
-                        safe_step = max(s_step, 0.01)
-                        steps = int((s_max - s_min) / safe_step) + 1
-                        for scale in np.linspace(s_min, s_max, steps):
-                            if 0.99 < scale < 1.01: continue
-                            rw = int(template.shape[1] * scale)
-                            rh = int(template.shape[0] * scale)
-                            if rw < 1 or rh < 1: continue
-                            resized_tpl = cv2.resize(template, (rw, rh))
-                            templates_list.append((scale, resized_tpl))
-                        self.scaled_templates_cache[cache_key] = templates_list
+            image = load_source_image(path)
+            self.scale_options_cache[str(cache_key)] = (s_min, s_max, s_step)
+            work_img = image.convert('L' if use_gray else 'RGB')
+            template = np.array(work_img)
+            if not use_gray:
+                template = cv2.cvtColor(template, cv2.COLOR_RGB2BGR)
 
-            for task in tasks:
-                cmd = task.get("type")
+            templates_list = []
+            actual_bytes = int(template.nbytes)
+            for scale in scale_values:
+                if self.check_stop_flag():
+                    raise RuntimeError("资源预加载已停止")
+                rw = max(1, int(round(template.shape[1] * scale)))
+                rh = max(1, int(round(template.shape[0] * scale)))
+                interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+                resized_tpl = cv2.resize(template, (rw, rh), interpolation=interpolation)
+                actual_bytes += int(resized_tpl.nbytes)
+                templates_list.append((float(scale), resized_tpl))
+            self.scaled_templates_cache[cache_key] = templates_list
+            self.scaled_template_cache_bytes += actual_bytes
+
+        for task_idx, task in enumerate(tasks, 1):
+            if self.check_stop_flag():
+                return False
+            cmd = task.get("type")
+            try:
                 if cmd in [1.0, 2.0, 3.0, 8.0]:
                     path = str(task.get("value", ""))
                     if not path or not os.path.exists(path) or ',' in path:
                         continue
-                    try:
-                        if task.get("custom_en", False):
-                            s_min = float(task.get("custom_scale_min", self.min_scale))
-                            s_max = float(task.get("custom_scale_max", self.max_scale))
-                            s_step = float(task.get("custom_scale_step", self.scale_step))
-                            use_gray = bool(task.get("custom_gray", self.enable_grayscale))
-                        else:
-                            s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
-                            use_gray = self.enable_grayscale
-                    except:
+                    if config_bool(task.get("custom_en", False)):
+                        s_min = float(task.get("custom_scale_min", self.min_scale))
+                        s_max = float(task.get("custom_scale_max", self.max_scale))
+                        s_step = float(task.get("custom_scale_step", self.scale_step))
+                        use_gray = config_bool(task.get("custom_gray", self.enable_grayscale))
+                    else:
                         s_min, s_max, s_step = self.min_scale, self.max_scale, self.scale_step
                         use_gray = self.enable_grayscale
 
@@ -3559,35 +4027,35 @@ class RPAEngine:
                     preload_one(path, cache_key, s_min, s_max, s_step, use_gray)
                 elif cmd == TASK_TYPE_UNTIL:
                     for cond in self.until_conditions_from_task(task):
-                        if cond.get("mode") == "区域发生变化":
+                        mode = cond.get("mode")
+                        if mode == "区域发生变化":
                             continue
                         path = str(cond.get("image", "")).strip()
                         if not path or not os.path.exists(path):
+                            continue
+                        if mode == "区域变成指定图片":
+                            load_source_image(path)
                             continue
                         conf = self.condition_confidence(cond)
                         use_gray = self.enable_grayscale
                         cache_key = self.condition_cache_key(path, cond.get("index", 0), conf, use_gray)
                         task[f"until_cond{cond.get('index')}_cache_key"] = cache_key
                         preload_one(path, cache_key, self.min_scale, self.max_scale, self.scale_step, use_gray)
-            write_log("资源预加载完成。")
-        except Exception as e:
-            write_log(f"预计算失败: {e}")
+            except Exception as e:
+                errors.append(f"第 {task_idx} 步：{e}")
+
+        if errors:
+            for error in errors[:20]:
+                write_log(f"预计算失败: {error}")
+            if len(errors) > 20:
+                write_log(f"预计算失败: 另有 {len(errors) - 20} 条错误未显示")
+            return False
+        write_log("资源预加载完成。")
+        return True
 
     def find_target_in_screenshot(self, img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y):
-        if SLIM_BUILD:
-            try:
-                target = self.img_cache.get(img_path)
-                if target is None:
-                    if not os.path.exists(img_path):
-                        return None
-                    target = Image.open(img_path)
-                    target.load()
-                    self.img_cache[img_path] = target
-                res = pyautogui.locate(target, screenshot_pil, grayscale=False)
-                if res:
-                    return (res.left + (res.width / 2) + offset_x, res.top + (res.height / 2) + offset_y, 1.0)
-            except:
-                pass
+        valid, _reason = self.matching_template_status(img_path, use_gray)
+        if not valid:
             return None
         if not self.opencv_available:
             if img_path in self.img_cache:
@@ -3655,25 +4123,29 @@ class RPAEngine:
         quick_region = self.quick_search_region(img_path, cache_key, task_conf, use_gray, search_regions)
         if quick_region:
             native_found = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=False, quick_region=quick_region)
+            if native_found is not None:
+                if native_found:
+                    found = native_found[0]
+                    self.last_target_positions[position_key] = (found[0], found[1])
+                    return found
+            else:
+                try:
+                    screenshot_pil, offset_x, offset_y = self.capture_screenshot(quick_region)
+                    found = self.find_target_in_screenshot(img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y)
+                    if found:
+                        self.last_target_positions[position_key] = (found[0], found[1])
+                        return found
+                except:
+                    pass
+            self.last_target_positions.pop(position_key, None)
+
+        native_found = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=False, search_regions=search_regions)
+        if native_found is not None:
             if native_found:
                 found = native_found[0]
                 self.last_target_positions[position_key] = (found[0], found[1])
                 return found
-            try:
-                screenshot_pil, offset_x, offset_y = self.capture_screenshot(quick_region)
-                found = self.find_target_in_screenshot(img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y)
-                if found:
-                    self.last_target_positions[position_key] = (found[0], found[1])
-                    return found
-            except:
-                pass
-            self.last_target_positions.pop(position_key, None)
-
-        native_found = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=False, search_regions=search_regions)
-        if native_found:
-            found = native_found[0]
-            self.last_target_positions[position_key] = (found[0], found[1])
-            return found
+            return None
 
         try:
             for screenshot_pil, offset_x, offset_y in self.iter_search_screenshots(search_regions):
@@ -3784,27 +4256,9 @@ class RPAEngine:
         return self.point_click_counts[key]
 
     def find_all_targets_in_screenshot(self, img_path, cache_key, task_conf, use_gray, screenshot_pil, offset_x, offset_y, search_regions=None):
-        if SLIM_BUILD:
-            try:
-                target = self.img_cache.get(img_path)
-                if target is None:
-                    if not os.path.exists(img_path):
-                        return []
-                    target = Image.open(img_path)
-                    target.load()
-                    self.img_cache[img_path] = target
-                boxes = list(pyautogui.locateAll(target, screenshot_pil, grayscale=False))
-                matches = [{
-                    "x": box.left + (box.width / 2) + offset_x,
-                    "y": box.top + (box.height / 2) + offset_y,
-                    "scale": 1.0,
-                    "score": 1.0,
-                    "radius": max(4.0, min(box.width, box.height) * 0.55)
-                } for box in boxes]
-                return [(p["x"], p["y"], p["scale"], p["score"]) for p in self._sort_targets_for_click(self._dedupe_targets(matches))]
-            except:
-                one = self.find_target_optimized(img_path, cache_key, task_conf, use_gray, search_regions)
-                return [(one[0], one[1], one[2], task_conf)] if one else []
+        valid, _reason = self.matching_template_status(img_path, use_gray)
+        if not valid:
+            return []
         if not self.opencv_available:
             try:
                 target = self.img_cache.get(img_path, img_path)
@@ -3864,7 +4318,7 @@ class RPAEngine:
 
     def find_all_targets_optimized(self, img_path, cache_key, task_conf, use_gray, search_regions=None):
         native_targets = self.native_find_targets(img_path, cache_key, task_conf, use_gray, find_all=True, search_regions=search_regions)
-        if native_targets:
+        if native_targets is not None:
             target_dicts = [{
                 "x": float(x),
                 "y": float(y),
@@ -4067,10 +4521,10 @@ class RPAEngine:
     def until_false_runtime(self, task, step_info):
         key = self.until_task_state_key(step_info)
         if key not in self.until_condition_started_at:
-            self.until_condition_started_at[key] = time.time()
+            self.until_condition_started_at[key] = time.monotonic()
         self.until_condition_counts[key] = self.until_condition_counts.get(key, 0) + 1
         false_count = self.until_condition_counts[key]
-        elapsed = time.time() - self.until_condition_started_at.get(key, time.time())
+        elapsed = time.monotonic() - self.until_condition_started_at.get(key, time.monotonic())
         max_checks = self.non_negative_int_value(task.get("until_max_checks", 0), 0)
         max_seconds = max(0.0, self.parse_float_value(task.get("until_max_seconds", 0), 0.0))
         reached = False
@@ -4087,6 +4541,9 @@ class RPAEngine:
         key = self.until_task_state_key(step_info)
         self.until_condition_counts.pop(key, None)
         self.until_condition_started_at.pop(key, None)
+        for baseline_key in list(self.until_condition_baselines.keys()):
+            if baseline_key and baseline_key[0] == key:
+                self.until_condition_baselines.pop(baseline_key, None)
 
     def coord_step_options(self, task):
         if not task or not self.as_bool(task.get("coord_step_en", False)):
@@ -4256,9 +4713,14 @@ class RPAEngine:
     def perform_mouse_click(self, x, y, clickTimes, lOrR, indicator_text=""):
         pyautogui.moveTo(x, y, duration=self.move_duration)
         for _ in range(clickTimes):
-            pyautogui.mouseDown(button=lOrR)
-            time.sleep(self.click_hold)
-            pyautogui.mouseUp(button=lOrR)
+            pressed = False
+            try:
+                pyautogui.mouseDown(button=lOrR)
+                pressed = True
+                time.sleep(self.click_hold)
+            finally:
+                if pressed:
+                    pyautogui.mouseUp(button=lOrR)
             if clickTimes > 1: time.sleep(0.02)
 
         self.report_click_indicator(x, y, indicator_text or f"{'左键' if lOrR == 'left' else '右键'}点击")
@@ -4271,7 +4733,7 @@ class RPAEngine:
 
     def mouseClick(self, clickTimes, lOrR, img_path, reTry, step_info=None, cache_key=None, task_conf=0.8, use_gray=True, point_limit_en=False, point_limit_count=0, coord_step_config=None, image_click_config=None, coord_sequence_config=None, search_regions=None):
         if step_info is None: step_info = {'step': 0, 'loop': 0, 'cmd': ''}
-        start_time = time.time()
+        start_time = time.monotonic()
         
         waiting_logged = False
         coord = self.parse_coordinate(img_path)
@@ -4285,7 +4747,7 @@ class RPAEngine:
 
         while True:
             if self.check_stop_flag(): return "stopped"
-            if self.timeout_val > 0 and (time.time() - start_time > self.timeout_val): 
+            if self.timeout_val > 0 and (time.monotonic() - start_time > self.timeout_val): 
                 if self.log_level >= 1:
                     self.log(f"<font color='orange'>    [超时] 循环#{step_info['loop']} 步{step_info['step']}: 等待目标超时</font>")
                 return "timeout"
@@ -4295,11 +4757,11 @@ class RPAEngine:
                     seq_point, seq_state, seq_status = self._coord_sequence_location(step_info, coord_sequence_config)
                     if seq_status == "done":
                         if self.log_level >= 1:
-                            self.log(f"<font color='gray'>    -> 自定义点位序列已点完，本步骤按设置跳过。</font>")
+                            self.log("<font color='gray'>    -> 自定义点位序列已点完，本步骤按设置跳过。</font>")
                         return "skipped"
                     if not seq_point:
                         if self.log_level >= 1:
-                            self.log(f"<font color='orange'>    -> 自定义点位序列为空，已跳过本步骤。</font>")
+                            self.log("<font color='orange'>    -> 自定义点位序列为空，已跳过本步骤。</font>")
                         return "skipped"
                     coord_state = None
                     locations = [(seq_point[0], seq_point[1], 1.0, 1.0)]
@@ -4311,13 +4773,13 @@ class RPAEngine:
                     locations = [(coord[0], coord[1], 1.0, 1.0)]
                 find_time = 0.0
             elif need_all_matches:
-                find_start = time.time()
+                find_start = time.monotonic()
                 locations = self.find_all_targets_optimized(img_path, cache_key, task_conf, use_gray, search_regions)
-                find_time = time.time() - find_start
+                find_time = time.monotonic() - find_start
             else:
-                find_start = time.time()
+                find_start = time.monotonic()
                 location_tuple = self.find_target_optimized(img_path, cache_key, task_conf, use_gray, search_regions)
-                find_time = time.time() - find_start
+                find_time = time.monotonic() - find_start
                 locations = [(location_tuple[0], location_tuple[1], location_tuple[2], task_conf)] if location_tuple else []
 
             if locations:
@@ -4401,7 +4863,7 @@ class RPAEngine:
                     return "not_found"
                 else:
                     if not waiting_logged and self.log_level >= 1:
-                        self.log(f"    -> 未发现目标，进入持续监听等待状态...")
+                        self.log("    -> 未发现目标，进入持续监听等待状态...")
                         waiting_logged = True
                     if not self.wait_recognition_interval(self.adaptive_extra_delay(img_path, step_info)):
                         return "stopped"
@@ -4422,10 +4884,15 @@ class RPAEngine:
             self.log(f"    -> 正在从 ({x1},{y1}) 拖拽到 ({x2},{y2})")
             
         pyautogui.moveTo(x1, y1, duration=self.move_duration)
-        pyautogui.mouseDown(button=button)
-        time.sleep(self.click_hold)
-        pyautogui.moveTo(x2, y2, duration=max(self.move_duration, 0.3))
-        pyautogui.mouseUp(button=button)
+        pressed = False
+        try:
+            pyautogui.mouseDown(button=button)
+            pressed = True
+            time.sleep(self.click_hold)
+            pyautogui.moveTo(x2, y2, duration=max(self.move_duration, 0.3))
+        finally:
+            if pressed:
+                pyautogui.mouseUp(button=button)
         self.report_click_indicator(x2, y2, "拖拽结束")
         return "success"
 
@@ -4458,9 +4925,9 @@ class RPAEngine:
                     loc = (coord[0], coord[1], 1.0)
                     find_time = 0.0
                 else:
-                    find_start = time.time()
+                    find_start = time.monotonic()
                     loc = self.find_target_optimized(val, cache_key, task_conf, use_gray, search_regions)
-                    find_time = time.time() - find_start
+                    find_time = time.monotonic() - find_start
 
                 if loc:
                     x, y, scale = loc[0], loc[1], loc[2]
@@ -4481,8 +4948,8 @@ class RPAEngine:
             elif cmd == 5.0:
                 wait_time = float(val) / max(self.playback_speed, 0.1)
                 if self.log_level >= 1: self.log(f"    -> 强制静默等待 {wait_time:.2f} 秒 (原录制设定 {val}s, 倍速 {self.playback_speed}x)...")
-                t_end = time.time() + wait_time
-                while time.time() < t_end:
+                t_end = time.monotonic() + wait_time
+                while time.monotonic() < t_end:
                     if self.check_stop_flag(): return "stopped"
                     time.sleep(0.05)
             elif cmd == 6.0:
@@ -4492,21 +4959,36 @@ class RPAEngine:
                 if self.log_level >= 1: self.log(f"    -> 触发系统按键组合: {val}")
                 pyautogui.hotkey(*[k.strip() for k in str(val).lower().split('+')])
             elif cmd == 9.0:
-                path = str(val)
-                if os.path.isdir(path): path = os.path.join(path, time.strftime("ss_%H%M%S.png"))
-                try:
-                    pyautogui.screenshot(path, region=self.scan_region)
-                    if self.log_level >= 1: self.log(f"    -> 已截图并保存至 {path}")
-                except: pass
+                path = str(val or "").strip()
+                if not path:
+                    raise ValueError("截图保存路径不能为空")
+                if os.path.isdir(path):
+                    milliseconds = int(time.time_ns() // 1_000_000) % 1000
+                    path = os.path.join(path, f"ss_{time.strftime('%Y%m%d_%H%M%S')}_{milliseconds:03d}.png")
+                parent_dir = os.path.dirname(os.path.abspath(path))
+                if not os.path.isdir(parent_dir):
+                    raise FileNotFoundError(f"截图保存目录不存在：{parent_dir}")
+                regions = self.normalized_regions(getattr(self, "scan_regions", []))
+                region = self.region_bounding_rect(regions) if regions else self.scan_region
+                screenshot_pil, _offset_x, _offset_y = self.capture_screenshot(region)
+                screenshot_pil.save(path)
+                if self.log_level >= 1:
+                    self.log(f"    -> 已截图并保存至 {path}")
         except Exception as step_e:
             status = "error"
             if self.log_level >= 1:
                 self.log(f"<font color='red'>    [严重异常] 循环#{step_info['loop']} 步{step_info['step']}: 执行崩溃 -> {step_e}</font>")
         return status
 
-    def run_tasks(self, tasks, callback_msg=None, callback_status=None, callback_click_indicator=None):
-        self.is_running = True
-        self.stop_requested = False
+    def run_tasks(self, tasks, callback_msg=None, callback_status=None, callback_click_indicator=None, run_id=None):
+        if run_id is None:
+            run_id = self.reserve_run()
+        elif not self.active_run_matches(run_id):
+            return
+        if run_id is None:
+            return
+
+        self.close_screenshot_backend()
         self.callback_msg = callback_msg
         self.callback_status = callback_status
         self.callback_click_indicator = callback_click_indicator
@@ -4523,14 +5005,28 @@ class RPAEngine:
         self.until_condition_started_at = {}
         self.miss_streaks = {}
         self.last_target_positions = {}
-        self.load_and_precompute(tasks)
-        
-        global_start_time = time.time()
-        loop_count = 0
+        self.template_validation_cache = {}
+        self.template_validation_reported = set()
+        self.scaled_template_cache_bytes = 0
+        if not self.load_and_precompute(tasks):
+            self.close_screenshot_backend()
+            self.callback_msg = None
+            self.callback_status = None
+            self.callback_click_indicator = None
+            self.finish_run(run_id)
+            if callback_msg:
+                callback_msg("资源预加载失败，运行已取消")
+            return
+
+        self.configure_global_deadline()
+        loop_count = max(0, int(self.loop_start_round) - 1)
 
         try:
             while True:
                 loop_count += 1
+
+                if self.global_time_limit_reached():
+                    break
                 
                 if self.loop_end_round > 0 and loop_count > self.loop_end_round:
                     if self.log_level >= 0:
@@ -4540,15 +5036,6 @@ class RPAEngine:
                 if self.loop_mode == "单次" and loop_count > 1: break
                 elif self.loop_mode == "指定次数" and loop_count > self.loop_val:
                     if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定循环次数 ({int(self.loop_val)}次)，任务正常结束</font>")
-                    break
-                elif self.loop_mode == "指定时间(时)" and (time.time() - global_start_time) / 3600.0 >= self.loop_val:
-                    if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定运行时间，任务正常结束</font>")
-                    break
-                elif self.loop_mode == "指定时间(分)" and (time.time() - global_start_time) / 60.0 >= self.loop_val:
-                    if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定运行时间，任务正常结束</font>")
-                    break
-                elif self.loop_mode == "指定时间(秒)" and (time.time() - global_start_time) >= self.loop_val:
-                    if self.log_level >= 0: self.log(f"<font color='green'>>>> 提示: 已达到指定运行时间，任务正常结束</font>")
                     break
 
                 if loop_count < self.loop_start_round:
@@ -4560,6 +5047,22 @@ class RPAEngine:
                 self.report_status(loop_count, 0, len(tasks), "")
 
                 idx = min(max(int(getattr(self, "start_step_index", 0)), 0), max(len(tasks) - 1, 0))
+                has_runnable_task = any(
+                    self.task_runnable_in_loop(tasks[task_idx], task_idx + 1, loop_count)
+                    for task_idx in range(idx, len(tasks))
+                )
+                if not has_runnable_task:
+                    next_loop = self.next_runnable_loop(tasks, loop_count)
+                    if next_loop is not None:
+                        if self.log_level >= 1:
+                            self.log(f"<font color='gray'>循环 #{loop_count} 没有可执行步骤，直接跳至第 {next_loop} 次循环。</font>")
+                        loop_count = next_loop - 1
+                        continue
+                    if self.log_level >= 0:
+                        self.log("<font color='green'>>>> 提示: 本次运行已没有当前或未来可执行的步骤，任务正常结束</font>")
+                    break
+
+                loop_made_progress = False
                 while idx < len(tasks):
                     task = tasks[idx]
                     
@@ -4615,9 +5118,6 @@ class RPAEngine:
                     else:
                         task_conf = self.confidence
                         use_gray = self.enable_grayscale
-                    if SLIM_BUILD:
-                        task_conf = self.confidence
-                        use_gray = False
                         
                     cache_key = task.get('cache_key', f"{val}_{self.min_scale}_{self.max_scale}_{self.scale_step}_{use_gray}")
 
@@ -4642,7 +5142,7 @@ class RPAEngine:
                     step_failed_for_branch = False
                     step_skipped_no_branch = False
                     last_status = None
-                    step_wall_start = time.time()
+                    step_wall_start = time.monotonic()
 
                     while target_successes is None or success_count < target_successes:
                         if self.check_stop_flag(): return
@@ -4651,9 +5151,9 @@ class RPAEngine:
                             if self.log_level >= 0:
                                 self.log(f"<font color='gray'>循环 #{loop_count} 步 {idx+1} ({cmd_name}) 已达到本次运行上限 {run_max_executions} 次，跳过本步。</font>")
                             break
-                        if no_skip_wait and self.timeout_val > 0 and (time.time() - step_wall_start > self.timeout_val):
+                        if no_skip_wait and self.timeout_val > 0 and (time.monotonic() - step_wall_start > self.timeout_val):
                             status = "timeout"
-                            step_duration = time.time() - step_wall_start
+                            step_duration = time.monotonic() - step_wall_start
                             if self.log_level >= 0:
                                 self.log(f"<font color='orange'>循环 #{loop_count} 步 {idx+1} ({cmd_name}) 禁止跳过等待超时，耗时: {step_duration:.2f}s</font>")
                             if self.timeout_stop:
@@ -4675,7 +5175,7 @@ class RPAEngine:
                         status_cmd_name = f"{cmd_name} {attempt_label}".strip()
                         step_info = {'step': idx + 1, 'loop': loop_count, 'cmd': status_cmd_name}
                         self.report_status(loop_count, idx + 1, len(tasks), status_cmd_name)
-                        step_start_time = time.time()
+                        step_start_time = time.monotonic()
 
                         needs_recognition_wait = (cmd in [1.0, 2.0, 3.0, 8.0] and not self.parse_coordinate(val)) or cmd == TASK_TYPE_UNTIL
                         extra_delay = self.adaptive_extra_delay(val, step_info) if (cmd in [1.0, 2.0, 3.0, 8.0] and not self.parse_coordinate(val)) else 0.0
@@ -4686,9 +5186,10 @@ class RPAEngine:
                         status = self.execute_task_once(cmd, val, retry, step_info, cache_key, task_conf, use_gray, point_limit_en, point_limit_count, coord_step_config, image_click_config, task, coord_sequence_config, search_regions)
                         last_status = status
                         if status != "skipped":
+                            loop_made_progress = True
                             self.step_execution_counts[step_exec_key] = self.step_execution_counts.get(step_exec_key, 0) + 1
 
-                        step_duration = time.time() - step_start_time
+                        step_duration = time.monotonic() - step_start_time
                         if self.log_level >= 0:
                             status_str = "完成"
                             color = "gray"
@@ -4729,7 +5230,7 @@ class RPAEngine:
                         if status in ["timeout", "not_found", "error"]:
                             if no_skip_wait and status != "timeout":
                                 if self.log_level >= 1:
-                                    self.log(f"    -> 本步骤已启用禁止跳过，将继续等待本步骤成功。")
+                                    self.log("    -> 本步骤已启用禁止跳过，将继续等待本步骤成功。")
                                 if not self.is_wait_command(cmd) and not self.wait_step_interval():
                                     return
                                 continue
@@ -4769,6 +5270,7 @@ class RPAEngine:
                             reached, reason, false_count, elapsed = self.until_false_runtime(task, {'step': idx + 1})
                             if reached:
                                 action = str(task.get("until_on_limit", "继续下一步"))
+                                self.reset_until_runtime({'step': idx + 1})
                                 if self.log_level >= 0:
                                     self.log(f"<font color='orange'><b>    -> [直到条件成立] {reason}，达到保护上限，处理方式：{action}。</b></font>")
                                 if action == "停止脚本":
@@ -4788,6 +5290,7 @@ class RPAEngine:
                                         self.log(f"<font color='#FF9800'><b>    -> [直到条件成立] 条件未满足（第 {false_count} 次，已等待 {elapsed:.1f}s），跳回第 {false_jump} 步。</b></font>")
                                 else:
                                     next_idx = idx + 1
+                                    self.reset_until_runtime({'step': idx + 1})
                                     if self.log_level >= 1:
                                         self.log("<font color='#FF9800'>    -> [直到条件成立] 条件未满足，但未设置跳回步骤，继续下一步。</font>")
 
@@ -4817,13 +5320,25 @@ class RPAEngine:
                     idx = next_idx
 
                 if self.check_stop_flag(): return
+                if not loop_made_progress:
+                    next_loop = self.next_runnable_loop(tasks, loop_count)
+                    if next_loop is not None:
+                        if self.log_level >= 1:
+                            self.log(f"<font color='gray'>循环 #{loop_count} 的步骤均已永久跳过，直接跳至第 {next_loop} 次循环。</font>")
+                        loop_count = next_loop - 1
+                        continue
+                    if self.log_level >= 0:
+                        self.log("<font color='green'>>>> 提示: 所有步骤均已完成或达到本次运行上限，任务正常结束</font>")
+                    break
                 
         except Exception as e:
             self.log(f"<font color='red'>引擎异常: {e}</font>")
         finally:
-            self.is_running = False
+            self.close_screenshot_backend()
+            self.callback_msg = None
             self.callback_status = None
             self.callback_click_indicator = None
+            self.finish_run(run_id)
             if callback_msg: callback_msg("结束")
 
 # --------------------------
@@ -4833,18 +5348,30 @@ class WorkerThread(QThread):
     log_signal = Signal(str)
     status_signal = Signal(dict)
     click_signal = Signal(dict)
-    finished_signal = Signal()
-    def __init__(self, engine, tasks):
+    def __init__(self, engine, tasks, run_id):
         super().__init__()
         self.engine = engine
         self.tasks = tasks
+        self.run_id = run_id
 
     def run(self):
-        self.watchdog = FailsafeWatchdog(self.engine)
-        self.watchdog.start()
-        self.engine.run_tasks(self.tasks, self.log_callback, self.status_callback, self.click_callback)
-        if self.watchdog: self.watchdog.kill()
-        self.finished_signal.emit()
+        self.watchdog = None
+        try:
+            self.watchdog = FailsafeWatchdog(self.engine)
+            self.watchdog.start()
+            self.engine.run_tasks(
+                self.tasks,
+                self.log_callback,
+                self.status_callback,
+                self.click_callback,
+                self.run_id,
+            )
+        finally:
+            if self.watchdog:
+                self.watchdog.kill()
+                self.watchdog.join(timeout=1.0)
+            if self.engine.active_run_matches(self.run_id):
+                self.engine.finish_run(self.run_id)
 
     def log_callback(self, msg): 
         if GLOBAL_CONFIG["log_to_ui"]:
@@ -5097,6 +5624,8 @@ class TaskRow(QFrame):
         dialog.accepted.connect(lambda d=dialog: self.apply_custom_config(d))
         dialog.finished.connect(lambda result, d=dialog: self.clear_custom_config_dialog(d, result))
         main_window = self.window()
+        if hasattr(main_window, "register_task_config_dialog"):
+            main_window.register_task_config_dialog(dialog)
         if hasattr(main_window, "apply_ui_scale_to_widget"):
             main_window.apply_ui_scale_to_widget(dialog)
         dialog.show()
@@ -5154,7 +5683,18 @@ class TaskRow(QFrame):
                 delattr(self, attr)
         if getattr(self, "config_dialog", None) is dialog:
             self.config_dialog = None
+        main_window = self.window()
+        if hasattr(main_window, "unregister_task_config_dialog"):
+            main_window.unregister_task_config_dialog(dialog)
         dialog.deleteLater()
+
+    def close_config_dialog(self):
+        dialog = getattr(self, "config_dialog", None)
+        if dialog:
+            try:
+                dialog.close()
+            except RuntimeError:
+                self.config_dialog = None
 
     def image_settings_available(self):
         text = self.type_combo.currentText()
@@ -5217,7 +5757,7 @@ class TaskRow(QFrame):
         elif "单击" in text or "双击" in text or "悬停" in text:
             self.file_btn.setVisible(True)
             self.file_btn.setText("图")
-            self.file_btn.setToolTip("选择本地图片\n性能建议：尽量截取小而独特的目标图片，少包含背景，可降低CPU匹配压力并减少误识别")
+            self.file_btn.setToolTip("选择本地图片\n性能建议：尽量截取小而独特的目标图片，少包含背景，可降低CPU匹配压力并减少误识别。\n安全提示：不要只截纯色或几乎没有纹理的区域，这类图片会被程序拒绝。")
         else:
             self.file_btn.setVisible(False)
 
@@ -5461,7 +6001,11 @@ class RPAWindow(QMainWindow):
         self.engine = RPAEngine()
         
         self.config_path = os.path.join(get_base_dir(), "config.ini")
+        self.profile_backup_path = os.path.join(get_base_dir(), "profiles_backup.json")
         self.settings = QSettings(self.config_path, QSettings.IniFormat)
+        self._profiles_save_signature = ""
+        self._profiles_save_in_progress = False
+        self._config_recovery_message = ""
         self.ui_base_font = QFont(QApplication.font())
         self.ui_scale = 1.0
         self.recorder_ui = None
@@ -5493,6 +6037,11 @@ class RPAWindow(QMainWindow):
         self.key_mapping_hook = None
         self.mapping_hook_hotkeys = set()
         self.mapping_pickers = {}
+        self._bulk_mapping_update = False
+        self.start_in_progress = False
+        self._close_after_worker = False
+        self._close_state_saved = False
+        self.task_config_dialogs = set()
         if HAS_PSUTIL:
             try: self.current_process = psutil.Process()
             except: pass
@@ -5622,7 +6171,7 @@ class RPAWindow(QMainWindow):
         self.scale_min = QLineEdit("0.8"); self.scale_min.setFixedWidth(70); gl1.addWidget(self.scale_min)
         gl1.addWidget(QLabel("-")); 
         self.scale_max = QLineEdit("1.2"); self.scale_max.setFixedWidth(70); gl1.addWidget(self.scale_max)
-        gl1.addWidget(HelpBtn("【缩放范围】\n程序启动时会预先生成缩放模板缓存。建议不要超过 0.8 - 2.0。"))
+        gl1.addWidget(HelpBtn("【缩放范围】\n程序启动时会预先生成缩放模板缓存。建议不要超过 0.8 - 2.0。\n为防止内存耗尽，单张图片最多生成 61 个缩放档位，缩放值最高为 5.0。"))
         gl1.addSpacing(15)
         gl1.addWidget(QLabel("步长:")); 
         self.scale_step = QLineEdit("0.05"); self.scale_step.setFixedWidth(70); gl1.addWidget(self.scale_step)
@@ -5640,15 +6189,6 @@ class RPAWindow(QMainWindow):
         gl1_native.addStretch()
         gl1_wrap.addLayout(gl1)
         gl1_wrap.addLayout(gl1_native)
-        if SLIM_BUILD:
-            self.scale_min.setText("1.0")
-            self.scale_max.setText("1.0")
-            self.scale_step.setText("0.05")
-            self.gray_chk.setChecked(False)
-            self.native_core_chk.setChecked(False)
-            for widget in [self.scale_min, self.scale_max, self.scale_step, self.gray_chk, self.native_core_chk]:
-                widget.setEnabled(False)
-                widget.setToolTip("精简版已移除缩放识别、灰度识别和 DLL/OpenCV 识别核心。")
         g1.set_content_layout(gl1_wrap)
         settings_content_layout.addWidget(g1)
         
@@ -5713,11 +6253,11 @@ class RPAWindow(QMainWindow):
         gl_multi = QHBoxLayout()
         gl_multi.addWidget(QLabel("目标模式:"))
         self.multi_mode_combo = QComboBox()
-        self.multi_mode_combo.addItems(["最佳一个", "全部匹配"])
+        self.multi_mode_combo.addItems(["快速一个", "全部匹配"])
         self.multi_mode_combo.setFixedWidth(120)
         self.multi_mode_combo.currentTextChanged.connect(self.update_multi_target_ui)
         gl_multi.addWidget(self.multi_mode_combo)
-        gl_multi.addWidget(HelpBtn("【目标模式】\n最佳一个：走最快路径，只计算当前截图里相似度最高的一个位置并点击，适合普通单目标脚本。\n全部匹配：执行更完整的峰值搜索，一次找出所有超过相似度阈值的目标并逐个点击，CPU压力更高。"))
+        gl_multi.addWidget(HelpBtn("【目标模式】\n快速一个：走最快路径，找到第一个达到相似度阈值的位置后立即点击；不保证它是全屏及全部缩放结果中相似度最高的位置，适合普通单目标脚本。\n全部匹配：执行更完整的峰值搜索，一次找出所有超过相似度阈值的目标并逐个点击，CPU压力更高。"))
         gl_multi.addSpacing(15)
         gl_multi.addWidget(QLabel("点击顺序:"))
         self.multi_order_combo = QComboBox()
@@ -5855,7 +6395,7 @@ class RPAWindow(QMainWindow):
         self.mapping_click_mode_combo.addItems(["真实鼠标点击", "点击后返回原位", "后台窗口点击(实验)"])
         self.mapping_click_mode_combo.setMinimumWidth(150)
         map_mode_row.addWidget(self.mapping_click_mode_combo)
-        map_mode_row.addWidget(HelpBtn("【映射点击方式】\n真实鼠标点击：兼容性最好，会把鼠标移动到目标点。\n点击后返回原位：先移动到目标点点击，再立刻回到触发前的鼠标位置；实际鼠标仍会瞬间移动。\n后台窗口点击(实验)：不移动鼠标，会优先选择坐标下方最深层的子窗口/控件并发送点击消息；只对部分普通窗口/控件有效，游戏、浏览器画布、DirectX 或权限更高的窗口可能无效，失败时会自动回退真实鼠标点击。\n如果目标窗口以管理员身份运行导致后台点击无效，请尝试以管理员身份运行本软件。"))
+        map_mode_row.addWidget(HelpBtn("【映射点击方式】\n真实鼠标点击：兼容性最好，会把鼠标移动到目标点。\n点击后返回原位：先移动到目标点点击，再立刻回到触发前的鼠标位置；实际鼠标仍会瞬间移动。\n后台窗口点击(实验)：不移动鼠标，只向槽位已经绑定的目标窗口/控件发送点击消息；请先通过“取”或“窗”按钮完成绑定。目标失效时不会回退真实鼠标点击，以免误点其他窗口。\n只对部分普通窗口/控件有效；游戏、浏览器画布、DirectX 或权限更高的窗口可能无效。若权限不同，请尝试以管理员身份运行本软件。"))
         map_mode_row.addStretch()
         map_main.addLayout(map_mode_row)
         self.key_mapping_rows = []
@@ -5878,6 +6418,10 @@ class RPAWindow(QMainWindow):
         settings_content_layout.addWidget(g_map)
 
         links_row = QHBoxLayout()
+        platform_label = QLabel(f"系统支持：{SUPPORTED_WINDOWS_TEXT}")
+        platform_label.setStyleSheet("color: #666;")
+        platform_label.setToolTip("当前完整版本按 64 位 Python、Qt 和原生 DLL 构建，不支持 32 位 Windows。")
+        links_row.addWidget(platform_label)
         links_row.addStretch()
         bilibili_btn = QPushButton("作者B站主页")
         bilibili_btn.clicked.connect(lambda: self.open_web_url("https://space.bilibili.com/95794432/dynamic"))
@@ -5968,6 +6512,17 @@ class RPAWindow(QMainWindow):
         self.init_profiles()
         self.bind_setting_logs()
         self.update_hotkeys()
+        self.profiles_autosave_timer = QTimer(self)
+        self.profiles_autosave_timer.timeout.connect(self.autosave_profiles_if_changed)
+        self.profiles_autosave_timer.start(3000)
+        if self._config_recovery_message:
+            QTimer.singleShot(0, self.show_config_recovery_message)
+
+    def show_config_recovery_message(self):
+        """Show recovery details only while the main window is still in use."""
+        if not self._config_recovery_message or not self.isVisible():
+            return
+        QMessageBox.warning(self, "配置恢复提示", self._config_recovery_message)
 
     def open_config_dir(self):
         try:
@@ -6086,6 +6641,22 @@ class RPAWindow(QMainWindow):
         self.settings_dialog.save_dialog_geometry()
         self.settings_dialog.hide()
 
+    def register_task_config_dialog(self, dialog):
+        if not dialog:
+            return
+        self.task_config_dialogs.add(dialog)
+        dialog.destroyed.connect(lambda *_args, d=dialog: self.task_config_dialogs.discard(d))
+
+    def unregister_task_config_dialog(self, dialog):
+        self.task_config_dialogs.discard(dialog)
+
+    def close_all_task_config_dialogs(self):
+        for dialog in list(getattr(self, "task_config_dialogs", set())):
+            try:
+                dialog.close()
+            except RuntimeError:
+                self.task_config_dialogs.discard(dialog)
+
     def show_running_status_overlay(self, position_name):
         if self.running_overlay is None:
             self.running_overlay = RunningStatusOverlay()
@@ -6101,9 +6672,15 @@ class RPAWindow(QMainWindow):
 
     def show_click_indicator_overlay(self, data):
         try:
-            overlay = ClickPointOverlay(data.get("x", 0), data.get("y", 0), data.get("text", ""))
             if not hasattr(self, "click_indicator_overlays"):
                 self.click_indicator_overlays = []
+            while len(self.click_indicator_overlays) >= MAX_CLICK_INDICATOR_OVERLAYS:
+                oldest = self.click_indicator_overlays.pop(0)
+                try:
+                    oldest.close()
+                except RuntimeError:
+                    pass
+            overlay = ClickPointOverlay(data.get("x", 0), data.get("y", 0), data.get("text", ""))
             self.click_indicator_overlays.append(overlay)
             overlay.destroyed.connect(lambda *_args, o=overlay: self.click_indicator_overlays.remove(o) if o in self.click_indicator_overlays else None)
         except Exception as e:
@@ -6151,6 +6728,11 @@ class RPAWindow(QMainWindow):
         pick.setFixedWidth(34)
         row_layout.addWidget(pick)
 
+        bind_window = QPushButton("窗")
+        bind_window.setFixedWidth(34)
+        bind_window.setToolTip("把当前坐标绑定到其下方的目标窗口/控件，供后台窗口点击使用")
+        row_layout.addWidget(bind_window)
+
         action = QComboBox()
         action.addItems(["左键单击", "左键双击", "右键单击"])
         action.setFixedWidth(100)
@@ -6163,12 +6745,15 @@ class RPAWindow(QMainWindow):
 
         row_data = {
             "container": container, "enabled": en, "hotkey": hotkey, "key_btn": key_btn,
-            "coord": coord, "pick": pick, "action": action, "delete_btn": delete_btn
+            "coord": coord, "pick": pick, "bind_window": bind_window, "action": action,
+            "delete_btn": delete_btn, "window_binding": {}
         }
 
         key_btn.clicked.connect(lambda _=False, r=row_data: self.capture_mapping_hotkey_by_row(r))
         pick.clicked.connect(lambda _=False, r=row_data: self.start_mapping_coordinate_pick_by_row(r))
+        bind_window.clicked.connect(lambda _=False, r=row_data: self.bind_mapping_window_by_row(r))
         delete_btn.clicked.connect(lambda _=False, r=row_data: self.remove_key_mapping_row(r))
+        coord.textChanged.connect(lambda _text, r=row_data: self.clear_mapping_window_binding(r))
         for widget in [en, hotkey, coord, action]:
             if isinstance(widget, QLineEdit):
                 widget.editingFinished.connect(self.refresh_hotkey_backend)
@@ -6192,6 +6777,9 @@ class RPAWindow(QMainWindow):
         parsed = parse_hotkey_text(data.get("hotkey", f"F{idx + 1}"))
         row["hotkey"].setText(parsed["display"] if parsed else str(data.get("hotkey", f"F{idx + 1}")))
         row["coord"].setText(str(data.get("coord", "")))
+        binding = data.get("window_binding", {})
+        row["window_binding"] = dict(binding) if isinstance(binding, dict) else {}
+        self.update_mapping_window_binding_ui(row)
         row["action"].setCurrentText(str(data.get("action", "左键单击")))
 
     def clear_key_mapping_rows(self):
@@ -6243,22 +6831,30 @@ class RPAWindow(QMainWindow):
                 "enabled": row["enabled"].isChecked(),
                 "hotkey": row["hotkey"].text().strip(),
                 "coord": row["coord"].text().strip(),
-                "action": row["action"].currentText()
+                "action": row["action"].currentText(),
+                "window_binding": dict(row.get("window_binding", {})),
             })
         return mappings
 
     def apply_key_mappings_config(self, mappings, desired_count=None):
         mappings = mappings if isinstance(mappings, list) else []
+        if len(mappings) > MAX_KEY_MAPPINGS:
+            write_log(f"按键映射数量超过上限 {MAX_KEY_MAPPINGS}，多余内容已忽略。")
+            mappings = mappings[:MAX_KEY_MAPPINGS]
         try:
             count = int(float(desired_count)) if desired_count is not None else (len(mappings) if mappings else HOTKEY_MAPPING_COUNT)
         except:
             count = len(mappings) if mappings else HOTKEY_MAPPING_COUNT
-        count = max(0, max(count, len(mappings)))
-        self.clear_key_mapping_rows()
-        for idx in range(count):
-            data = mappings[idx] if idx < len(mappings) and isinstance(mappings[idx], dict) else None
-            self.add_key_mapping_row(data=data, refresh=False)
-        self.refresh_mapping_row_labels()
+        count = min(MAX_KEY_MAPPINGS, max(0, max(count, len(mappings))))
+        self._bulk_mapping_update = True
+        try:
+            self.clear_key_mapping_rows()
+            for idx in range(count):
+                data = mappings[idx] if idx < len(mappings) and isinstance(mappings[idx], dict) else None
+                self.add_key_mapping_row(data=data, refresh=False)
+            self.refresh_mapping_row_labels()
+        finally:
+            self._bulk_mapping_update = False
         self.refresh_hotkey_backend()
 
     def capture_start_hotkey(self):
@@ -6305,6 +6901,106 @@ class RPAWindow(QMainWindow):
 
     def on_mapping_coordinate_picked_by_row(self, row_data, value):
         self.on_mapping_coordinate_picked(self.mapping_row_index(row_data), value)
+        self.bind_mapping_window_by_row(row_data, show_message=False)
+
+    def clear_mapping_window_binding(self, row_data):
+        row_data["window_binding"] = {}
+        self.update_mapping_window_binding_ui(row_data)
+
+    def update_mapping_window_binding_ui(self, row_data):
+        button = row_data.get("bind_window")
+        if not button:
+            return
+        binding = row_data.get("window_binding", {})
+        if binding:
+            title = str(binding.get("root_title", "")).strip()
+            class_name = str(binding.get("root_class", "")).strip()
+            target_text = title or class_name or "目标窗口"
+            button.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            button.setToolTip(f"已绑定：{target_text}\n点击可按当前坐标重新绑定")
+        else:
+            button.setStyleSheet("")
+            button.setToolTip("尚未绑定目标窗口；后台窗口点击前必须先绑定")
+
+    def hwnd_class_name(self, hwnd):
+        if not hwnd:
+            return ""
+        buff = ctypes.create_unicode_buffer(256)
+        try:
+            length = user32.GetClassNameW(hwnd, buff, len(buff))
+            return buff.value[:length] if length > 0 else ""
+        except Exception:
+            return ""
+
+    def hwnd_title(self, hwnd):
+        if not hwnd:
+            return ""
+        try:
+            length = max(0, int(user32.GetWindowTextLengthW(hwnd)))
+            buff = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buff, len(buff))
+            return buff.value
+        except Exception:
+            return ""
+
+    def hwnd_process_info(self, hwnd):
+        pid = wintypes.DWORD(0)
+        try:
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        except Exception:
+            return 0, ""
+        process_path = ""
+        if HAS_PSUTIL and pid.value:
+            try:
+                process_path = os.path.normcase(os.path.abspath(psutil.Process(pid.value).exe()))
+            except Exception:
+                process_path = ""
+        return int(pid.value), process_path
+
+    def bind_mapping_window_by_row(self, row_data, show_message=True):
+        coord = parse_coordinate_text(row_data.get("coord").text() if row_data.get("coord") else "")
+        if not coord:
+            if show_message:
+                QMessageBox.warning(self, "无法绑定窗口", "请先填写或选取有效坐标。")
+            return False
+        x, y = coord
+        target_hwnd = self.background_click_target_hwnd(x, y)
+        root_hwnd = user32.GetAncestor(target_hwnd, GA_ROOT) if target_hwnd else None
+        if not target_hwnd or not root_hwnd:
+            if show_message:
+                QMessageBox.warning(self, "无法绑定窗口", "当前坐标下没有可绑定的窗口或控件。")
+            return False
+
+        root_point = POINT(int(x), int(y))
+        target_point = POINT(int(x), int(y))
+        if not user32.ScreenToClient(root_hwnd, ctypes.byref(root_point)) or not user32.ScreenToClient(target_hwnd, ctypes.byref(target_point)):
+            if show_message:
+                QMessageBox.warning(self, "无法绑定窗口", "无法换算目标窗口的客户区坐标。")
+            return False
+
+        pid, process_path = self.hwnd_process_info(root_hwnd)
+        try:
+            control_id = int(user32.GetDlgCtrlID(target_hwnd))
+        except Exception:
+            control_id = 0
+        row_data["window_binding"] = {
+            "root_hwnd": int(root_hwnd),
+            "target_hwnd": int(target_hwnd),
+            "pid": pid,
+            "process_path": process_path,
+            "root_class": self.hwnd_class_name(root_hwnd),
+            "root_title": self.hwnd_title(root_hwnd),
+            "target_class": self.hwnd_class_name(target_hwnd),
+            "target_control_id": control_id if control_id > 0 else 0,
+            "root_client_x": int(root_point.x),
+            "root_client_y": int(root_point.y),
+            "target_client_x": int(target_point.x),
+            "target_client_y": int(target_point.y),
+        }
+        self.update_mapping_window_binding_ui(row_data)
+        if show_message and GLOBAL_CONFIG["log_to_ui"]:
+            self.append_log("<font color='green'>按键映射已绑定目标窗口；后台点击将只发送给该目标。</font>")
+        return True
 
     def active_key_mappings(self):
         mappings = []
@@ -6327,7 +7023,8 @@ class RPAWindow(QMainWindow):
                 "bare": parsed["bare"],
                 "safe_global": is_safe_global_hotkey(parsed),
                 "coord": coord,
-                "action": row["action"].currentText()
+                "action": row["action"].currentText(),
+                "window_binding": dict(row.get("window_binding", {})),
             })
         return mappings
 
@@ -6357,9 +7054,14 @@ class RPAWindow(QMainWindow):
         try:
             pyautogui.moveTo(x, y, duration=0)
             for _ in range(click_times):
-                pyautogui.mouseDown(button=button)
-                time.sleep(0.04)
-                pyautogui.mouseUp(button=button)
+                pressed = False
+                try:
+                    pyautogui.mouseDown(button=button)
+                    pressed = True
+                    time.sleep(0.04)
+                finally:
+                    if pressed:
+                        pyautogui.mouseUp(button=button)
                 if click_times > 1:
                     time.sleep(0.02)
         finally:
@@ -6372,12 +7074,14 @@ class RPAWindow(QMainWindow):
                     except:
                         pass
 
-    def background_click_target_hwnd(self, x, y):
+    def background_click_target_hwnd(self, x, y, expected_root=None):
         point = POINT(int(x), int(y))
         base_hwnd = user32.WindowFromPoint(point)
         if not base_hwnd:
             return None
         root_hwnd = user32.GetAncestor(base_hwnd, GA_ROOT) or base_hwnd
+        if expected_root and int(root_hwnd) != int(expected_root):
+            return None
         candidates = []
 
         def add_candidate(hwnd):
@@ -6415,16 +7119,119 @@ class RPAWindow(QMainWindow):
         candidates.sort(key=lambda item: (item[0], -item[1]))
         return candidates[0][2]
 
-    def perform_mapping_background_click(self, x, y, button, click_times):
-        # Best-effort 后台点击：PostMessage 只能表示消息成功投递，目标窗口仍可能选择忽略。
-        hwnd = self.background_click_target_hwnd(x, y)
-        if not hwnd:
+    def window_matches_binding(self, hwnd, binding):
+        if not hwnd or not user32.IsWindow(hwnd):
             return False
-        client_point = POINT(int(x), int(y))
-        if not user32.ScreenToClient(hwnd, ctypes.byref(client_point)):
+        expected_class = str(binding.get("root_class", "")).strip()
+        if expected_class and self.hwnd_class_name(hwnd) != expected_class:
             return False
+        pid, process_path = self.hwnd_process_info(hwnd)
+        expected_path = os.path.normcase(str(binding.get("process_path", "")).strip())
+        if expected_path:
+            if process_path != expected_path:
+                return False
+        else:
+            expected_title = str(binding.get("root_title", "")).strip()
+            if expected_title:
+                if self.hwnd_title(hwnd) != expected_title:
+                    return False
+            elif int(binding.get("pid", 0) or 0) != pid:
+                return False
+        return True
 
-        lparam = make_mouse_lparam(client_point.x, client_point.y)
+    def resolve_mapping_window_binding(self, binding):
+        if not isinstance(binding, dict) or not binding:
+            return None
+
+        root_hwnd = None
+        try:
+            stored_root = int(binding.get("root_hwnd", 0))
+        except Exception:
+            stored_root = 0
+        if stored_root and self.window_matches_binding(stored_root, binding):
+            root_hwnd = stored_root
+
+        if not root_hwnd:
+            candidates = []
+            expected_title = str(binding.get("root_title", "")).strip()
+            expected_path = os.path.normcase(str(binding.get("process_path", "")).strip())
+
+            def enum_proc(hwnd, _lparam):
+                if not user32.IsWindowVisible(hwnd) or not self.window_matches_binding(hwnd, binding):
+                    return True
+                pid, path = self.hwnd_process_info(hwnd)
+                score = 0
+                if expected_path and path == expected_path:
+                    score += 8
+                if expected_title and self.hwnd_title(hwnd) == expected_title:
+                    score += 4
+                if int(binding.get("pid", 0) or 0) == pid:
+                    score += 2
+                candidates.append((score, int(hwnd)))
+                return True
+
+            try:
+                callback = WNDENUMPROC(enum_proc)
+                user32.EnumWindows(callback, 0)
+            except Exception:
+                candidates = []
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            root_hwnd = candidates[0][1]
+
+        target_hwnd = None
+        try:
+            stored_target = int(binding.get("target_hwnd", 0))
+        except Exception:
+            stored_target = 0
+        expected_target_class = str(binding.get("target_class", "")).strip()
+        if stored_target and user32.IsWindow(stored_target):
+            stored_target_root = user32.GetAncestor(stored_target, GA_ROOT) or stored_target
+            if int(stored_target_root) == int(root_hwnd):
+                if not expected_target_class or self.hwnd_class_name(stored_target) == expected_target_class:
+                    target_hwnd = stored_target
+
+        if not target_hwnd:
+            control_id = int(binding.get("target_control_id", 0) or 0)
+            if control_id > 0:
+                candidate = user32.GetDlgItem(root_hwnd, control_id)
+                if candidate and (not expected_target_class or self.hwnd_class_name(candidate) == expected_target_class):
+                    target_hwnd = candidate
+
+        if target_hwnd:
+            client_x = int(binding.get("target_client_x", 0) or 0)
+            client_y = int(binding.get("target_client_y", 0) or 0)
+        else:
+            screen_point = POINT(
+                int(binding.get("root_client_x", 0) or 0),
+                int(binding.get("root_client_y", 0) or 0),
+            )
+            if not user32.ClientToScreen(root_hwnd, ctypes.byref(screen_point)):
+                return None
+            target_hwnd = self.background_click_target_hwnd(screen_point.x, screen_point.y, expected_root=root_hwnd)
+            if not target_hwnd:
+                return None
+            target_point = POINT(screen_point.x, screen_point.y)
+            if not user32.ScreenToClient(target_hwnd, ctypes.byref(target_point)):
+                return None
+            client_x, client_y = int(target_point.x), int(target_point.y)
+
+        client_rect = RECT()
+        if not user32.GetClientRect(target_hwnd, ctypes.byref(client_rect)):
+            return None
+        if not (client_rect.left <= client_x < client_rect.right and client_rect.top <= client_y < client_rect.bottom):
+            return None
+        return target_hwnd, client_x, client_y
+
+    def perform_mapping_background_click(self, binding, button, click_times):
+        # PostMessage 只能表示消息已投递，目标窗口仍可能主动忽略该消息。
+        resolved = self.resolve_mapping_window_binding(binding)
+        if not resolved:
+            return False
+        hwnd, client_x, client_y = resolved
+
+        lparam = make_mouse_lparam(client_x, client_y)
         if button == "right":
             down_msg, up_msg, dbl_msg, down_flag = WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON
         else:
@@ -6440,16 +7247,15 @@ class RPAWindow(QMainWindow):
             time.sleep(0.02 if msg == up_msg else 0.01)
         return ok
 
-    def perform_key_mapping_click(self, x, y, button, click_times):
+    def perform_key_mapping_click(self, x, y, button, click_times, window_binding=None):
         mode = self.current_mapping_click_mode()
         if mode == "点击后返回原位":
             self.perform_mapping_mouse_click(x, y, button, click_times, restore_position=True)
             return mode
         if mode == "后台窗口点击(实验)":
-            if self.perform_mapping_background_click(x, y, button, click_times):
+            if self.perform_mapping_background_click(window_binding, button, click_times):
                 return mode
-            self.perform_mapping_mouse_click(x, y, button, click_times, restore_position=False)
-            return f"{mode}失败，已回退真实鼠标点击"
+            return f"{mode}失败，未执行点击"
         self.perform_mapping_mouse_click(x, y, button, click_times, restore_position=False)
         return mode
 
@@ -6470,7 +7276,12 @@ class RPAWindow(QMainWindow):
         button = "right" if "右键" in action else "left"
         click_times = 2 if "双击" in action else 1
         try:
-            click_mode = self.perform_key_mapping_click(x, y, button, click_times)
+            click_mode = self.perform_key_mapping_click(x, y, button, click_times, mapping.get("window_binding"))
+            if "失败" in click_mode:
+                if GLOBAL_CONFIG["log_to_ui"]:
+                    self.append_log(f"<font color='orange'>按键映射{map_idx + 1} 后台点击失败，未执行任何点击；请重新绑定目标窗口或改用其他点击方式。</font>")
+                QToolTip.showText(QCursor.pos(), "后台点击失败，未执行点击")
+                return
             if getattr(self, "click_indicator_chk", None) is None or self.click_indicator_chk.isChecked():
                 self.show_click_indicator_overlay({"x": x, "y": y, "text": f"映射{map_idx + 1}"})
             if GLOBAL_CONFIG["log_to_ui"]:
@@ -6625,16 +7436,168 @@ class RPAWindow(QMainWindow):
         if not is_at_bottom: scrollbar.setValue(old_val)
         else: scrollbar.setValue(scrollbar.maximum())
 
+    def validate_profile_config_data(self, cfg, label="方案"):
+        if not isinstance(cfg, dict):
+            return f"{label}不是有效的配置对象"
+        tasks = cfg.get("tasks", [])
+        if not isinstance(tasks, list):
+            return f"{label}的步骤列表格式错误"
+        if len(tasks) > MAX_TASKS_PER_PROFILE:
+            return f"{label}包含 {len(tasks)} 个步骤，超过上限 {MAX_TASKS_PER_PROFILE}"
+        if any(not isinstance(task, dict) for task in tasks):
+            return f"{label}包含格式错误的步骤"
+        if any(any(not isinstance(key, str) for key in task) for task in tasks):
+            return f"{label}包含非文本字段名的步骤"
+        mappings = cfg.get("key_mappings", [])
+        if not isinstance(mappings, list):
+            return f"{label}的按键映射格式错误"
+        if len(mappings) > MAX_KEY_MAPPINGS:
+            return f"{label}包含 {len(mappings)} 个按键映射，超过上限 {MAX_KEY_MAPPINGS}"
+        if any(not isinstance(mapping, dict) for mapping in mappings):
+            return f"{label}包含格式错误的按键映射"
+        if any(any(not isinstance(key, str) for key in mapping) for mapping in mappings):
+            return f"{label}包含非文本字段名的按键映射"
+        try:
+            desired_mapping_count = int(float(cfg.get("key_mapping_count", len(mappings))))
+        except Exception:
+            return f"{label}的按键映射数量设置无效"
+        if desired_mapping_count < 0 or desired_mapping_count > MAX_KEY_MAPPINGS:
+            return f"{label}的按键映射槽位数量必须在 0 到 {MAX_KEY_MAPPINGS} 之间"
+        try:
+            json.dumps(cfg, ensure_ascii=False)
+        except Exception as e:
+            return f"{label}包含无法保存的数据：{e}"
+        return None
+
+    def validate_profiles_payload(self, profiles):
+        if not isinstance(profiles, dict) or not profiles:
+            return "方案集合为空或格式错误"
+        if len(profiles) > MAX_PROFILES:
+            return f"方案数量 {len(profiles)} 超过上限 {MAX_PROFILES}"
+        for name, cfg in profiles.items():
+            if not isinstance(name, str) or not name.strip():
+                return "存在空名称或非文本名称的方案"
+            error = self.validate_profile_config_data(cfg, f"方案“{name}”")
+            if error:
+                return error
+        return None
+
+    def preserve_corrupt_config(self):
+        if not os.path.isfile(self.config_path):
+            return ""
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        target = f"{self.config_path}.corrupt_{timestamp}.bak"
+        try:
+            shutil.copy2(self.config_path, target)
+            return target
+        except Exception as e:
+            write_log(f"保存损坏配置副本失败: {e}")
+            return ""
+
+    def load_profiles_backup(self):
+        if not os.path.isfile(self.profile_backup_path):
+            return None, None, "没有找到自动备份"
+        try:
+            with open(self.profile_backup_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+            if isinstance(payload, dict) and payload.get("format") == "waterRPA_profiles_backup":
+                profiles = payload.get("profiles")
+                current_profile = payload.get("current_profile")
+            else:
+                profiles = payload
+                current_profile = None
+            error = self.validate_profiles_payload(profiles)
+            if error:
+                return None, None, error
+            return profiles, current_profile, ""
+        except Exception as e:
+            return None, None, str(e)
+
+    def profiles_backup_payload(self):
+        return {
+            "format": "waterRPA_profiles_backup",
+            "version": 1,
+            "app_version": APP_VERSION,
+            "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "current_profile": self.current_profile_name,
+            "profiles": self.profiles_data,
+        }
+
+    def persist_profiles_state(self, force=False):
+        if self._profiles_save_in_progress or self.is_switching_profile:
+            return True
+        self._profiles_save_in_progress = True
+        try:
+            if self.current_profile_name and hasattr(self, "task_list"):
+                self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
+            error = self.validate_profiles_payload(self.profiles_data)
+            if error:
+                raise ValueError(error)
+            payload_text = json.dumps(self.profiles_data, ensure_ascii=False, sort_keys=True)
+            signature = hashlib.sha256(
+                f"{self.current_profile_name}\n{payload_text}".encode("utf-8")
+            ).hexdigest()
+            if not force and signature == self._profiles_save_signature:
+                return True
+
+            atomic_write_json(self.profile_backup_path, self.profiles_backup_payload())
+            self.settings.setValue("profiles_json", payload_text)
+            self.settings.setValue("current_profile", self.current_profile_name)
+            self.settings.sync()
+            if self.settings.status() != QSettings.NoError:
+                raise OSError(f"QSettings 写入失败，状态码 {self.settings.status()}")
+            self._profiles_save_signature = signature
+            return True
+        except Exception as e:
+            write_log(f"自动保存配置失败: {e}")
+            return False
+        finally:
+            self._profiles_save_in_progress = False
+
+    def autosave_profiles_if_changed(self):
+        if getattr(self, "_close_state_saved", False):
+            return
+        self.persist_profiles_state(force=False)
+
     def init_profiles(self):
         saved_profiles = self.settings.value("profiles_json", "{}")
-        try: self.profiles_data = json.loads(saved_profiles)
-        except: self.profiles_data = {}
-        
+        recovered_current = None
+        load_error = ""
+        if not self.settings.contains("profiles_json"):
+            profiles = {}
+        else:
+            try:
+                profiles = json.loads(saved_profiles) if isinstance(saved_profiles, str) else saved_profiles
+                load_error = self.validate_profiles_payload(profiles) or ""
+                if load_error:
+                    profiles = None
+            except Exception as e:
+                profiles = None
+                load_error = str(e)
+
+        if profiles is None:
+            corrupt_copy = self.preserve_corrupt_config()
+            profiles, recovered_current, backup_error = self.load_profiles_backup()
+            if profiles is not None:
+                self._config_recovery_message = (
+                    "主配置无法读取，程序已从自动备份恢复方案。\n\n"
+                    f"原配置问题：{load_error or '格式错误'}"
+                )
+            else:
+                profiles = {}
+                self._config_recovery_message = (
+                    "主配置和自动备份都无法读取，程序已创建默认方案。\n\n"
+                    f"主配置问题：{load_error or '格式错误'}\n备份问题：{backup_error}"
+                )
+            if corrupt_copy:
+                self._config_recovery_message += f"\n\n原配置副本已保留在：\n{corrupt_copy}"
+
+        self.profiles_data = profiles
         if not self.profiles_data:
             self.profiles_data["默认方案"] = self.get_default_config_dict()
             
         self.profile_combo.addItems(list(self.profiles_data.keys()))
-        last_prof = self.settings.value("current_profile", "默认方案")
+        last_prof = recovered_current or self.settings.value("current_profile", "默认方案")
         if last_prof in self.profiles_data:
             self.profile_combo.setCurrentText(last_prof)
         else:
@@ -6643,14 +7606,24 @@ class RPAWindow(QMainWindow):
         self.is_switching_profile = False
         self.current_profile_name = self.profile_combo.currentText()
         self.apply_ui_config(self.profiles_data[self.current_profile_name])
+        try:
+            if self._config_recovery_message:
+                self._profiles_save_signature = ""
+                return
+            payload_text = json.dumps(self.profiles_data, ensure_ascii=False, sort_keys=True)
+            self._profiles_save_signature = hashlib.sha256(
+                f"{self.current_profile_name}\n{payload_text}".encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            self._profiles_save_signature = ""
 
     def get_default_config_dict(self):
         return {
-            "conf": "0.8", "scale_min": "1.0" if SLIM_BUILD else "0.8", "scale_max": "1.0" if SLIM_BUILD else "1.2", "scale_step": "0.05", "gray_en": False if SLIM_BUILD else True, "native_core_en": False if SLIM_BUILD else True,
+            "conf": "0.8", "scale_min": "0.8", "scale_max": "1.2", "scale_step": "0.05", "gray_en": True, "native_core_en": True,
             "dodge_x1": "100", "dodge_y1": "100", "dodge_x2": "200", "dodge_y2": "100",
             "dodge_en": False, "dbl_dodge": False, "dbl_wait": "0.015",
             "move_spd": "0.0", "click_hld": "0.04", "settle": "0.5", "timeout": "0.0", "timeout_stop": False, "detect_delay": "0.1", "adaptive_backoff": True, "playback_speed": "1.0",
-            "multi_target_mode": "最佳一个", "multi_target_order": "从上到下",
+            "multi_target_mode": "快速一个", "multi_target_order": "从上到下",
             "hotkey_start": "F9", "hotkey_stop": "F10", "log_level": 0,
             "tm_fs": True, "tr_fs": True, "key_fs": True,
             "log_f": False, "log_ui": True, "mini": False, "top": False,
@@ -6691,20 +7664,14 @@ class RPAWindow(QMainWindow):
             self.scale_min.setText(str(cfg.get("scale_min", "0.8")))
             self.scale_max.setText(str(cfg.get("scale_max", "1.2")))
             self.scale_step.setText(str(cfg.get("scale_step", "0.05")))
-            self.gray_chk.setChecked(bool(cfg.get("gray_en", True)))
+            self.gray_chk.setChecked(config_bool(cfg.get("gray_en", True)))
             self.native_core_chk.setChecked(config_bool(cfg.get("native_core_en", True)))
-            if SLIM_BUILD:
-                self.scale_min.setText("1.0")
-                self.scale_max.setText("1.0")
-                self.scale_step.setText("0.05")
-                self.gray_chk.setChecked(False)
-                self.native_core_chk.setChecked(False)
             self.dodge_x1.setText(str(cfg.get("dodge_x1", "100")))
             self.dodge_y1.setText(str(cfg.get("dodge_y1", "100")))
             self.dodge_x2.setText(str(cfg.get("dodge_x2", "200")))
             self.dodge_y2.setText(str(cfg.get("dodge_y2", "100")))
-            self.dodge_chk.setChecked(bool(cfg.get("dodge_en", False)))
-            self.double_dodge_chk.setChecked(bool(cfg.get("dbl_dodge", False)))
+            self.dodge_chk.setChecked(config_bool(cfg.get("dodge_en", False)))
+            self.double_dodge_chk.setChecked(config_bool(cfg.get("dbl_dodge", False)))
             self.dbl_wait.setText(str(cfg.get("dbl_wait", "0.015")))
             
             self.move_spd.setText(str(cfg.get("move_spd", "0.0")))
@@ -6715,7 +7682,12 @@ class RPAWindow(QMainWindow):
             self.detect_delay.setText(str(cfg.get("detect_delay", "0.1")))
             self.adaptive_backoff_chk.setChecked(config_bool(cfg.get("adaptive_backoff", True)))
             self.playback_speed.setText(str(cfg.get("playback_speed", "1.0")))
-            self.multi_mode_combo.setCurrentText(str(cfg.get("multi_target_mode", "最佳一个")))
+            multi_target_mode = str(cfg.get("multi_target_mode", "快速一个"))
+            if multi_target_mode == "最佳一个":
+                multi_target_mode = "快速一个"
+            if self.multi_mode_combo.findText(multi_target_mode) < 0:
+                multi_target_mode = "快速一个"
+            self.multi_mode_combo.setCurrentText(multi_target_mode)
             self.multi_order_combo.setCurrentText(str(cfg.get("multi_target_order", "从上到下")))
             self.update_multi_target_ui()
             
@@ -6725,15 +7697,15 @@ class RPAWindow(QMainWindow):
             self.hotkey_stop_edit.setText(stop_parsed["display"] if stop_parsed else str(cfg.get("hotkey_stop", "F10")))
             self.log_level_combo.setCurrentIndex(int(cfg.get("log_level", 0)))
             
-            self.tm_failsafe.setChecked(bool(cfg.get("tm_fs", True)))
-            self.tr_failsafe.setChecked(bool(cfg.get("tr_fs", True)))
-            self.key_failsafe.setChecked(bool(cfg.get("key_fs", True)))
+            self.tm_failsafe.setChecked(config_bool(cfg.get("tm_fs", True)))
+            self.tr_failsafe.setChecked(config_bool(cfg.get("tr_fs", True)))
+            self.key_failsafe.setChecked(config_bool(cfg.get("key_fs", True)))
             
-            self.log_file_chk.setChecked(bool(cfg.get("log_f", False)))
-            self.log_ui_chk.setChecked(bool(cfg.get("log_ui", True)))
-            self.mini_chk.setChecked(bool(cfg.get("mini", False)))
-            self.top_chk.setChecked(bool(cfg.get("top", False)))
-            self.run_status_chk.setChecked(bool(cfg.get("run_status_tip", True)))
+            self.log_file_chk.setChecked(config_bool(cfg.get("log_f", False)))
+            self.log_ui_chk.setChecked(config_bool(cfg.get("log_ui", True)))
+            self.mini_chk.setChecked(config_bool(cfg.get("mini", False)))
+            self.top_chk.setChecked(config_bool(cfg.get("top", False)))
+            self.run_status_chk.setChecked(config_bool(cfg.get("run_status_tip", True)))
             self.run_status_pos_combo.setCurrentText(str(cfg.get("run_status_pos", "右上角")))
             self.click_indicator_chk.setChecked(config_bool(cfg.get("click_indicator", True)))
             self.start_step_edit.setText(str(cfg.get("start_step", "1")))
@@ -6750,6 +7722,7 @@ class RPAWindow(QMainWindow):
             self.mapping_click_mode_combo.setCurrentText(str(cfg.get("mapping_click_mode", "真实鼠标点击")))
             self.apply_key_mappings_config(cfg.get("key_mappings", []), cfg.get("key_mapping_count", None))
             
+            self.close_all_task_config_dialogs()
             self.task_list.clear()
             tasks = cfg.get("tasks", [])
             for d in tasks: self.add_row(d)
@@ -6774,6 +7747,9 @@ class RPAWindow(QMainWindow):
             self.append_log(f"<b><font color='purple'>>>> 已切换至配置方案: {new_name}</font></b>")
 
     def create_new_profile(self):
+        if len(self.profiles_data) >= MAX_PROFILES:
+            QMessageBox.warning(self, "无法新建", f"方案数量已达到上限 {MAX_PROFILES}。")
+            return
         text, ok = QInputDialog.getText(self, "新建方案", "请输入新方案名称:")
         if ok and text:
             if text in self.profiles_data:
@@ -6853,8 +7829,18 @@ class RPAWindow(QMainWindow):
             self.is_switching_profile = False
 
     def start_recording(self):
+        if getattr(self, "recorder_ui", None):
+            try:
+                self.recorder_ui.close()
+            except RuntimeError:
+                pass
         self.showMinimized()
         self.recorder_ui = RecorderUI(self)
+        recorder = self.recorder_ui
+        recorder.destroyed.connect(
+            lambda *_args, r=recorder: setattr(self, "recorder_ui", None)
+            if getattr(self, "recorder_ui", None) is r else None
+        )
 
     def bind_setting_logs(self):
         self.conf_edit.editingFinished.connect(lambda: self.log_setting_change("相似度", self.conf_edit.text()))
@@ -6986,13 +7972,18 @@ class RPAWindow(QMainWindow):
 
     def stop_key_mapping_hook(self):
         hook = getattr(self, "key_mapping_hook", None)
-        self.key_mapping_hook = None
-        self.mapping_hook_hotkeys = set()
         if hook and hook.isRunning():
             hook.stop()
-            hook.wait(700)
+            if not hook.wait(1500):
+                write_log("按键映射钩子未能在限定时间内停止，暂不创建新的钩子。")
+                return False
+        self.key_mapping_hook = None
+        self.mapping_hook_hotkeys = set()
+        return True
 
     def refresh_mapping_mode_hook(self):
+        if getattr(self, "_bulk_mapping_update", False):
+            return
         if not getattr(self, "mapping_mode_chk", None):
             return
         wanted = set()
@@ -7007,7 +7998,8 @@ class RPAWindow(QMainWindow):
             return
         if getattr(self, "key_mapping_hook", None) and self.key_mapping_hook.isRunning() and wanted == getattr(self, "mapping_hook_hotkeys", set()):
             return
-        self.stop_key_mapping_hook()
+        if not self.stop_key_mapping_hook():
+            return
         self.mapping_hook_hotkeys = set(wanted)
         self.key_mapping_hook = KeyMappingHookThread(self.mapping_hook_hotkeys)
         self.key_mapping_hook.triggered.connect(self.execute_key_mapping_by_hotkey)
@@ -7066,6 +8058,8 @@ class RPAWindow(QMainWindow):
         return False
 
     def refresh_hotkey_backend(self):
+        if getattr(self, "_bulk_mapping_update", False):
+            return
         if not getattr(self, "hotkey_timer", None):
             return
         if self.register_global_hotkeys():
@@ -7195,16 +8189,35 @@ class RPAWindow(QMainWindow):
         self.append_log(f"已锁定 {len(regions)} 个识别区域(物理)，只在这些区域内找图 (速度+++)") 
 
     def closeEvent(self, event):
-        """终极修复：强力异常捕获+强制放行，确保不管什么情况点X号都能瞬间关掉软件"""
         try:
-            self.stop_key_mapping_hook()
-            self.unregister_global_hotkeys()
-            self.settings.setValue("window_geometry", self.saveGeometry())
+            if not self._close_state_saved:
+                if getattr(self, "profiles_autosave_timer", None):
+                    self.profiles_autosave_timer.stop()
+                if not self.stop_key_mapping_hook():
+                    event.ignore()
+                    QTimer.singleShot(100, self.close)
+                    return
+                self.unregister_global_hotkeys()
+                self.settings.setValue("window_geometry", self.saveGeometry())
+                if getattr(self, "settings_dialog", None):
+                    self.settings_dialog.save_dialog_geometry()
+                self.persist_profiles_state(force=True)
+                self.settings.sync()
+                self._close_state_saved = True
+
+            if getattr(self, "recorder_ui", None):
+                self.recorder_ui.close()
+            if getattr(self, "region_win", None):
+                self.region_win.close()
             if getattr(self, "settings_dialog", None):
-                self.settings_dialog.save_dialog_geometry()
-            self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
-            self.settings.setValue("profiles_json", json.dumps(self.profiles_data))
-            self.settings.setValue("current_profile", self.current_profile_name)
+                self.settings_dialog.close()
+            self.close_all_task_config_dialogs()
+            for picker in list(getattr(self, "mapping_pickers", {}).values()):
+                try:
+                    picker.close()
+                except RuntimeError:
+                    pass
+
             self.close_all_coordinate_click_preview()
             for overlay in list(getattr(self, "click_indicator_overlays", [])):
                 try:
@@ -7213,16 +8226,18 @@ class RPAWindow(QMainWindow):
                     pass
             
             if getattr(self, 'worker', None) and self.worker.isRunning():
+                self._close_after_worker = True
                 self.engine.stop()
-                self.worker.quit()
-                self.worker.wait(1000)
+                self.centralWidget().setEnabled(False)
+                self.setWindowTitle(f"waterRPA {APP_VERSION} - 正在安全停止脚本…")
+                event.ignore()
+                return
             if self.running_overlay:
                 self.running_overlay.close()
             self.close_all_coordinate_click_preview()
         except Exception as e:
             write_log(f"退出前保存异常: {e}")
-        finally:
-            event.accept()
+        event.accept()
 
     def update_log_config(self):
         GLOBAL_CONFIG["log_to_file"] = self.log_file_chk.isChecked()
@@ -7286,6 +8301,7 @@ class RPAWindow(QMainWindow):
     def restore_task_snapshot(self, tasks):
         self.restoring_history = True
         try:
+            self.close_all_task_config_dialogs()
             self.task_list.clear()
             for data in tasks:
                 self.add_row(data, record_undo=False, select=False)
@@ -7334,6 +8350,8 @@ class RPAWindow(QMainWindow):
 
     def del_row(self, row_widget):
         self.push_undo_state()
+        if hasattr(row_widget, "close_config_dialog"):
+            row_widget.close_config_dialog()
         for i in range(self.task_list.count()):
             item = self.task_list.item(i)
             if self.task_list.itemWidget(item) == row_widget:
@@ -7468,8 +8486,7 @@ class RPAWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "导出方案", filter="JSON (*.json)")
         if path:
             try:
-                with open(path, 'w', encoding='utf-8') as f: 
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                atomic_write_json(path, data)
                 if GLOBAL_CONFIG["log_to_ui"]:
                     self.append_log(f"<font color='green'><b>>>> 方案已成功导出至: {path}</b></font>")
             except Exception as e:
@@ -7502,6 +8519,7 @@ class RPAWindow(QMainWindow):
                 "format": "waterRPA_full_package",
                 "version": 2,
                 "app_version": APP_VERSION,
+                "supported_windows": SUPPORTED_WINDOWS_TEXT,
                 "profile_name": self.current_profile_name,
                 "asset_count": len(asset_map),
                 "missing_images": missing,
@@ -7528,7 +8546,17 @@ class RPAWindow(QMainWindow):
         target_abs = os.path.abspath(target_dir)
         os.makedirs(target_abs, exist_ok=True)
         with zipfile.ZipFile(zip_path, "r") as zf:
-            for member in zf.infolist():
+            members = zf.infolist()
+            if len(members) > MAX_PACKAGE_FILES:
+                raise ValueError(f"压缩包文件数量超过上限 {MAX_PACKAGE_FILES}")
+            declared_total = sum(max(0, int(member.file_size)) for member in members if not member.is_dir())
+            if declared_total > MAX_PACKAGE_TOTAL_BYTES:
+                raise ValueError(
+                    f"压缩包解压后预计超过 {MAX_PACKAGE_TOTAL_BYTES / 1024 / 1024:.0f} MB 上限"
+                )
+            seen_names = set()
+            actual_total = 0
+            for member in members:
                 name = member.filename.replace("\\", "/")
                 if name.endswith("/"):
                     continue
@@ -7536,12 +8564,28 @@ class RPAWindow(QMainWindow):
                     raise ValueError(f"压缩包包含不安全路径：{member.filename}")
                 if name not in ["profile.json", "manifest.json"] and not name.startswith("assets/"):
                     continue
+                normalized_name = name.casefold()
+                if normalized_name in seen_names:
+                    raise ValueError(f"压缩包包含重复路径：{member.filename}")
+                seen_names.add(normalized_name)
+                if member.file_size > MAX_PACKAGE_FILE_BYTES:
+                    raise ValueError(
+                        f"压缩包中的文件过大：{member.filename}（单文件上限 "
+                        f"{MAX_PACKAGE_FILE_BYTES / 1024 / 1024:.0f} MB）"
+                    )
                 dest = os.path.abspath(os.path.join(target_abs, name))
                 if not (dest == target_abs or dest.startswith(target_abs + os.sep)):
                     raise ValueError(f"压缩包路径越界：{member.filename}")
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with zf.open(member) as src, open(dest, "wb") as dst:
-                    shutil.copyfileobj(src, dst)
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        actual_total += len(chunk)
+                        if actual_total > MAX_PACKAGE_TOTAL_BYTES:
+                            raise ValueError("压缩包实际解压大小超过安全上限")
+                        dst.write(chunk)
 
     def load_full_package(self, path):
         base_name = os.path.splitext(os.path.basename(path))[0]
@@ -7562,7 +8606,11 @@ class RPAWindow(QMainWindow):
         def import_mapper(src):
             text = str(src or "").strip().replace("\\", "/")
             if text.startswith("assets/"):
-                return os.path.abspath(os.path.join(package_dir, text))
+                candidate = os.path.abspath(os.path.join(package_dir, text))
+                assets_root = os.path.abspath(os.path.join(package_dir, "assets"))
+                if not candidate.startswith(assets_root + os.sep) or not os.path.isfile(candidate):
+                    raise ValueError(f"全量包引用了无效图片路径：{text}")
+                return candidate
             return None
 
         data = self.rewrite_profile_image_paths(data, import_mapper)
@@ -7572,6 +8620,8 @@ class RPAWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "导入方案", filter="waterRPA 方案 (*.json *.zip);;JSON (*.json);;全量包 (*.zip)")
         if path:
             try:
+                if len(self.profiles_data) >= MAX_PROFILES:
+                    raise ValueError(f"方案数量已达到上限 {MAX_PROFILES}，请先删除不再需要的方案")
                 if path.lower().endswith(".zip"):
                     data, base_name = self.load_full_package(path)
                 else:
@@ -7593,6 +8643,10 @@ class RPAWindow(QMainWindow):
                 else:
                     raise ValueError("无法识别的配置文件格式")
 
+                profile_error = self.validate_profile_config_data(new_profile_data, "导入方案")
+                if profile_error:
+                    raise ValueError(profile_error)
+
                 self.profiles_data[self.current_profile_name] = self.get_current_ui_config()
                 self.profiles_data[new_name] = new_profile_data
                 
@@ -7608,7 +8662,111 @@ class RPAWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.warning(self, "导入失败", str(e))
 
+    def validate_global_settings(self):
+        def number(label, raw, minimum=None, maximum=None, integer=False, strictly_positive=False):
+            text = str(raw).strip()
+            try:
+                value = float(text)
+            except Exception:
+                return None, f"设置里的“{label}”必须是数字！\n填入内容: {text}"
+            if not math.isfinite(value):
+                return None, f"设置里的“{label}”必须是有限数字！\n填入内容: {text}"
+            if integer and not value.is_integer():
+                return None, f"设置里的“{label}”必须是整数！\n填入内容: {text}"
+            if strictly_positive and value <= 0:
+                return None, f"设置里的“{label}”必须大于 0！\n填入内容: {text}"
+            if minimum is not None and value < minimum:
+                return None, f"设置里的“{label}”不能小于 {minimum:g}！\n填入内容: {text}"
+            if maximum is not None and value > maximum:
+                return None, f"设置里的“{label}”不能大于 {maximum:g}！\n填入内容: {text}"
+            return value, None
+
+        conf, error = number("全局相似度", self.conf_edit.text(), 0.05, 1.0)
+        if error:
+            return error
+        scale_min, error = number("最小缩放", self.scale_min.text(), 0.01, 5.0)
+        if error:
+            return error
+        scale_max, error = number("最大缩放", self.scale_max.text(), 0.01, 5.0)
+        if error:
+            return error
+        scale_step, error = number("缩放步长", self.scale_step.text(), strictly_positive=True)
+        if error:
+            return error
+        try:
+            build_scale_values(scale_min, scale_max, scale_step)
+        except ValueError as e:
+            return f"全局缩放设置无效：{e}"
+
+        checks = [
+            ("移动耗时", self.move_spd.text(), 0.0, 60.0, False, False),
+            ("按住时长", self.click_hld.text(), 0.0, 10.0, False, False),
+            ("步间隔", self.settle.text(), 0.0, None, False, False),
+            ("单步超时", self.timeout.text(), 0.0, None, False, False),
+            ("识别频率", self.detect_delay.text(), 0.0, 60.0, False, False),
+            ("二段避让间隔", self.dbl_wait.text(), 0.0, 60.0, False, False),
+            ("倍速执行", self.playback_speed.text(), None, 100.0, False, True),
+        ]
+        for args in checks:
+            _value, error = number(*args)
+            if error:
+                return error
+
+        for label, edit in [
+            ("避让坐标1 X", self.dodge_x1), ("避让坐标1 Y", self.dodge_y1),
+            ("避让坐标2 X", self.dodge_x2), ("避让坐标2 Y", self.dodge_y2),
+        ]:
+            _value, error = number(label, edit.text(), integer=True)
+            if error:
+                return error
+
+        loop_mode = self.loop_combo.currentText()
+        if loop_mode == "指定次数":
+            _value, error = number("循环次数", self.loop_val_edit.text(), integer=True, strictly_positive=True)
+            if error:
+                return error
+        elif loop_mode in ["指定时间(时)", "指定时间(分)", "指定时间(秒)"]:
+            _value, error = number("运行时间", self.loop_val_edit.text(), strictly_positive=True)
+            if error:
+                return error
+        return None
+
     def validate_tasks(self, tasks):
+        global_error = self.validate_global_settings()
+        if global_error:
+            return global_error
+
+        estimated_cache_total = 0
+        estimated_cache_keys = set()
+        global_scale_values = build_scale_values(
+            float(self.scale_min.text()), float(self.scale_max.text()), float(self.scale_step.text())
+        )
+        global_use_gray = self.gray_chk.isChecked()
+
+        def add_template_budget(path, use_gray, scale_values, step_no):
+            nonlocal estimated_cache_total
+            key = (os.path.abspath(path), bool(use_gray), tuple(scale_values))
+            if key in estimated_cache_keys:
+                return None
+            estimated_cache_keys.add(key)
+            try:
+                estimated = estimate_template_cache_bytes(path, use_gray, scale_values)
+            except ValueError as e:
+                return f"第 {step_no} 步模板无法读取：{e}"
+            if estimated > MAX_SINGLE_TEMPLATE_CACHE_BYTES:
+                return (
+                    f"第 {step_no} 步图片预计需要 {estimated / 1024 / 1024:.1f} MB 模板缓存，"
+                    f"超过单图上限 {MAX_SINGLE_TEMPLATE_CACHE_BYTES / 1024 / 1024:.0f} MB。\n"
+                    "请缩小模板图片或缩放范围。"
+                )
+            estimated_cache_total += estimated
+            if estimated_cache_total > MAX_TEMPLATE_CACHE_BYTES:
+                return (
+                    f"全部图片预计需要超过 {MAX_TEMPLATE_CACHE_BYTES / 1024 / 1024:.0f} MB 模板缓存。\n"
+                    "请减少图片数量、缩放范围或缩放档位。"
+                )
+            return None
+
         start_step = str(self.start_step_edit.text()).strip()
         if not start_step.isdigit() or int(start_step) < 1 or int(start_step) > len(tasks):
             return f"设置里的'从第X步开始执行'必须是 1 到 {len(tasks)} 之间的整数！\n填入内容: {start_step}"
@@ -7702,16 +8860,24 @@ class RPAWindow(QMainWindow):
                 if coord_step_reset_after and (not coord_step_reset_after.isdigit() or int(coord_step_reset_after) < 0):
                     return f"第 {i+1} 步小齿轮里的'重置循环'必须是大于等于 0 的整数！\n填入内容: {coord_step_reset_after}"
                 try:
-                    if float(coord_step_max_distance or 0) < 0:
+                    max_distance_value = float(coord_step_max_distance or 0)
+                    if not math.isfinite(max_distance_value) or max_distance_value < 0:
                         return f"第 {i+1} 步小齿轮里的'最大偏移距离'不能小于 0！\n填入内容: {coord_step_max_distance}"
                 except:
                     return f"第 {i+1} 步小齿轮里的'最大偏移距离'必须是数字！\n填入内容: {coord_step_max_distance}"
                 if coord_step_direction in ["向上", "向下", "向左", "向右"]:
-                    try: float(coord_step_distance)
-                    except: return f"第 {i+1} 步小齿轮里的'步进距离'必须是数字！\n填入内容: {coord_step_distance}"
+                    try:
+                        distance_value = float(coord_step_distance)
+                        if not math.isfinite(distance_value):
+                            raise ValueError
+                    except:
+                        return f"第 {i+1} 步小齿轮里的'步进距离'必须是有限数字！\n填入内容: {coord_step_distance}"
                 elif coord_step_direction == "自定义偏移":
                     try:
-                        float(coord_step_dx); float(coord_step_dy)
+                        dx_value = float(coord_step_dx)
+                        dy_value = float(coord_step_dy)
+                        if not math.isfinite(dx_value) or not math.isfinite(dy_value):
+                            raise ValueError
                     except:
                         return f"第 {i+1} 步小齿轮里的'自定义偏移 dx/dy'必须是数字！\n填入内容: dx={coord_step_dx}, dy={coord_step_dy}"
                 elif coord_step_direction == "移动到新点位":
@@ -7747,7 +8913,8 @@ class RPAWindow(QMainWindow):
                 if not max_checks.isdigit() or int(max_checks) < 0:
                     return f"第 {i+1} 步【直到条件成立】里的“最多检查次数”必须是大于等于 0 的整数！\n填入内容: {max_checks}"
                 try:
-                    if float(str(task.get("until_max_seconds", "0")).strip() or "0") < 0:
+                    max_seconds_value = float(str(task.get("until_max_seconds", "0")).strip() or "0")
+                    if not math.isfinite(max_seconds_value) or max_seconds_value < 0:
                         return f"第 {i+1} 步【直到条件成立】里的“最多等待秒数”不能小于 0！"
                 except:
                     return f"第 {i+1} 步【直到条件成立】里的“最多等待秒数”必须是数字！\n填入内容: {task.get('until_max_seconds')}"
@@ -7758,7 +8925,7 @@ class RPAWindow(QMainWindow):
                     image = str(cond.get("image", "")).strip()
                     region_text = str(cond.get("region", "")).strip()
                     if mode in ["图片出现", "图片消失", "区域变成指定图片"]:
-                        if not image or not os.path.exists(image):
+                        if not image or not os.path.isfile(image):
                             return f"第 {i+1} 步【直到条件成立】的条件{cond_no}图片路径不存在！\n填入内容: {image}"
                     if region_text and not parse_region_text(region_text):
                         return f"第 {i+1} 步【直到条件成立】的条件{cond_no}区域格式错误，应为 x,y,w,h！\n填入内容: {region_text}"
@@ -7766,31 +8933,79 @@ class RPAWindow(QMainWindow):
                         return f"第 {i+1} 步【直到条件成立】的条件{cond_no}必须填写或框选区域，格式为 x,y,w,h。"
                     try:
                         conf = float(cond.get("conf", "0.8"))
-                        if not (0.05 <= conf <= 1.0):
+                        if not math.isfinite(conf) or not (0.05 <= conf <= 1.0):
                             return f"第 {i+1} 步【直到条件成立】的条件{cond_no}图片相似度必须在 0.05 到 1.0 之间！"
                     except:
                         return f"第 {i+1} 步【直到条件成立】的条件{cond_no}图片相似度必须是数字！\n填入内容: {cond.get('conf')}"
                     try:
                         diff = float(cond.get("diff", "8"))
-                        if not (0 <= diff <= 100):
+                        if not math.isfinite(diff) or not (0 <= diff <= 100):
                             return f"第 {i+1} 步【直到条件成立】的条件{cond_no}变化阈值必须在 0 到 100 之间！"
                     except:
                         return f"第 {i+1} 步【直到条件成立】的条件{cond_no}变化阈值必须是数字！\n填入内容: {cond.get('diff')}"
                     try:
                         similarity = float(cond.get("similarity", "90"))
-                        if not (0 <= similarity <= 100):
+                        if not math.isfinite(similarity) or not (0 <= similarity <= 100):
                             return f"第 {i+1} 步【直到条件成立】的条件{cond_no}区域相似度必须在 0 到 100 之间！"
                     except:
                         return f"第 {i+1} 步【直到条件成立】的条件{cond_no}区域相似度必须是数字！\n填入内容: {cond.get('similarity')}"
+                    if mode in ["图片出现", "图片消失"]:
+                        valid, reason = template_detail_status(image, global_use_gray)
+                        if not valid:
+                            return f"第 {i+1} 步【直到条件成立】的条件{cond_no}模板不安全：{reason}"
+                        budget_error = add_template_budget(image, global_use_gray, global_scale_values, i + 1)
+                        if budget_error:
+                            return budget_error
+                    elif mode == "区域变成指定图片":
+                        budget_error = add_template_budget(image, False, [], i + 1)
+                        if budget_error:
+                            return budget_error
                 continue
             
-            if not v and t not in [9.0, 12.0, 13.0, 14.0]: 
+            if not v and t not in [12.0, 13.0, 14.0]: 
                 return f"第 {i+1} 步参数不能为空！"
             
             if t in [1.0, 2.0, 3.0, 8.0]: 
                 if not self.engine.parse_coordinate(v):
-                    if not os.path.exists(v):
+                    if not os.path.isfile(v):
                         return f"第 {i+1} 步找图错误：图片路径不存在或坐标格式错误 (坐标应为 x,y)\n填入内容: {v}"
+                    custom_en = config_bool(task.get("custom_en", False))
+                    try:
+                        task_conf = float(task.get("custom_conf", self.conf_edit.text())) if custom_en else float(self.conf_edit.text())
+                        if not math.isfinite(task_conf) or not (0.05 <= task_conf <= 1.0):
+                            raise ValueError
+                    except Exception:
+                        return f"第 {i+1} 步小齿轮里的独立相似度必须在 0.05 到 1.0 之间！"
+                    try:
+                        if custom_en:
+                            scale_min = float(task.get("custom_scale_min", self.scale_min.text()))
+                            scale_max = float(task.get("custom_scale_max", self.scale_max.text()))
+                            scale_step = float(task.get("custom_scale_step", self.scale_step.text()))
+                            if scale_min < 0.01 or scale_max > 5.0:
+                                raise ValueError("缩放范围必须在 0.01 到 5.0 之间")
+                            scale_values = build_scale_values(scale_min, scale_max, scale_step)
+                            use_gray = config_bool(task.get("custom_gray", global_use_gray))
+                        else:
+                            scale_values = global_scale_values
+                            use_gray = global_use_gray
+                    except Exception as e:
+                        return f"第 {i+1} 步小齿轮里的独立缩放设置无效：{e}"
+                    valid, reason = template_detail_status(v, use_gray)
+                    if not valid:
+                        return f"第 {i+1} 步模板无法安全识别：{reason}"
+                    budget_error = add_template_budget(v, use_gray, scale_values, i + 1)
+                    if budget_error:
+                        return budget_error
+            elif t == 9.0:
+                if os.path.isdir(v):
+                    pass
+                else:
+                    extension = os.path.splitext(v)[1].lower()
+                    if extension not in [".png", ".jpg", ".jpeg", ".bmp"]:
+                        return f"第 {i+1} 步截图保存路径必须是已存在的文件夹，或以 .png/.jpg/.jpeg/.bmp 结尾的文件路径！\n填入内容: {v}"
+                    parent_dir = os.path.dirname(os.path.abspath(v))
+                    if not os.path.isdir(parent_dir):
+                        return f"第 {i+1} 步截图保存目录不存在！\n目录: {parent_dir}"
             elif t in [10.0, 11.0]: 
                 if '->' not in v:
                     return f"第 {i+1} 步拖拽参数错误，需包含 '->' 符号，例如: 100,100 -> 200,200"
@@ -7798,8 +9013,14 @@ class RPAWindow(QMainWindow):
                 if not self.engine.parse_coordinate(parts[0]) or not self.engine.parse_coordinate(parts[1]):
                     return f"第 {i+1} 步拖拽坐标格式异常，无法解析出首尾坐标！"
             elif t in [5.0, 6.0]:
-                try: float(v)
-                except: return f"第 {i+1} 步参数必须是纯数字！"
+                try:
+                    number_value = float(v)
+                    if not math.isfinite(number_value):
+                        raise ValueError
+                    if t == 5.0 and number_value < 0:
+                        return f"第 {i+1} 步等待时间不能小于 0！"
+                except:
+                    return f"第 {i+1} 步参数必须是有限数字！"
         return None
 
     def analyze_loop_risks(self, tasks, cfg):
@@ -7837,6 +9058,10 @@ class RPAWindow(QMainWindow):
                 except:
                     false_jump = 1
                 try:
+                    true_jump = int(float(task.get("until_true_jump", 0)))
+                except:
+                    true_jump = 0
+                try:
                     max_checks = int(float(task.get("until_max_checks", 0)))
                 except:
                     max_checks = 0
@@ -7855,6 +9080,11 @@ class RPAWindow(QMainWindow):
                         if max_seconds > 0:
                             limit_text.append(f"最多等待 {max_seconds:g} 秒")
                         risks.append(f"第 {step_no} 步【直到条件成立】未满足时会跳回第 {false_jump} 步，满足或达到保护上限前会重复执行这一段；条件：{conditions_text}；保护：{'，'.join(limit_text)}。")
+                if true_jump > 0 and true_jump <= step_no:
+                    if true_jump == step_no:
+                        risks.append(f"第 {step_no} 步【直到条件成立】满足后仍跳回本步骤；只要条件持续满足，就会在本步骤原地循环。")
+                    else:
+                        risks.append(f"第 {step_no} 步【直到条件成立】满足后会跳回第 {true_jump} 步；如果条件持续满足，可能在第 {true_jump} 到第 {step_no} 步之间循环。")
 
             for key, label in [("success_jump", "成功后跳至"), ("fail_jump", "失败后跳至")]:
                 try:
@@ -7922,6 +9152,16 @@ class RPAWindow(QMainWindow):
         return True
 
     def start_task(self):
+        worker = getattr(self, "worker", None)
+        if self.start_in_progress or self.engine.is_running or (worker and worker.isRunning()):
+            return
+        self.start_in_progress = True
+        try:
+            self._start_task_impl()
+        finally:
+            self.start_in_progress = False
+
+    def _start_task_impl(self):
         cfg = self.get_current_ui_config()
         tasks = cfg.get("tasks", [])
         if not tasks: return
@@ -7938,7 +9178,7 @@ class RPAWindow(QMainWindow):
             self.engine.min_scale = float(cfg["scale_min"])
             self.engine.max_scale = float(cfg["scale_max"])
             self.engine.scale_step = float(cfg.get("scale_step", "0.05"))
-            self.engine.enable_grayscale = bool(cfg.get("gray_en", True))
+            self.engine.enable_grayscale = config_bool(cfg.get("gray_en", True))
             self.engine.dodge_x1 = int(cfg["dodge_x1"])
             self.engine.dodge_y1 = int(cfg["dodge_y1"])
             self.engine.dodge_x2 = int(cfg["dodge_x2"])
@@ -7954,17 +9194,11 @@ class RPAWindow(QMainWindow):
             self.engine.use_native_core = config_bool(cfg.get("native_core_en", True))
             self.engine.show_click_indicator = config_bool(cfg.get("click_indicator", True))
             self.engine.use_fast_screenshot = True
-            if SLIM_BUILD:
-                self.engine.min_scale = 1.0
-                self.engine.max_scale = 1.0
-                self.engine.scale_step = 0.05
-                self.engine.enable_grayscale = False
-                self.engine.use_native_core = False
             self.engine.playback_speed = float(cfg.get("playback_speed", "1.0"))
             self.engine.start_step_index = max(0, int(float(cfg.get("start_step", "1"))) - 1)
             self.engine.loop_start_round = max(1, int(float(cfg.get("loop_start_round", "1"))))
             self.engine.loop_end_round = max(0, int(float(cfg.get("loop_end_round", "0"))))
-            self.engine.multi_target_mode = cfg.get("multi_target_mode", "最佳一个")
+            self.engine.multi_target_mode = cfg.get("multi_target_mode", "快速一个")
             self.engine.multi_target_order = cfg.get("multi_target_order", "从上到下")
             
             self.engine.log_level = cfg["log_level"]
@@ -7972,19 +9206,19 @@ class RPAWindow(QMainWindow):
             try: self.engine.loop_val = float(cfg["loop_val"])
             except: self.engine.loop_val = 1.0
             
-            self.engine.enable_dodge = cfg["dodge_en"]
-            self.engine.enable_double_dodge = cfg["dbl_dodge"]
+            self.engine.enable_dodge = config_bool(cfg["dodge_en"])
+            self.engine.enable_double_dodge = config_bool(cfg["dbl_dodge"])
             self.engine.double_dodge_wait = float(cfg["dbl_wait"])
             
-            self.engine.enable_tm_stop = cfg["tm_fs"]
-            self.engine.enable_tr_stop = cfg["tr_fs"]
-            self.engine.enable_key_stop = cfg["key_fs"]
+            self.engine.enable_tm_stop = config_bool(cfg["tm_fs"])
+            self.engine.enable_tr_stop = config_bool(cfg["tr_fs"])
+            self.engine.enable_key_stop = config_bool(cfg["key_fs"])
         except: return QMessageBox.warning(self, "错误", "数值格式错误")
 
         if GLOBAL_CONFIG["log_to_ui"]:
             start_key = cfg["hotkey_start"]
             stop_key = cfg["hotkey_stop"]
-            multi_info = cfg.get("multi_target_mode", "最佳一个")
+            multi_info = cfg.get("multi_target_mode", "快速一个")
             if multi_info == "全部匹配":
                 multi_info = f"{multi_info}/{cfg.get('multi_target_order', '从上到下')}"
             start_step = int(float(cfg.get("start_step", "1")))
@@ -7994,29 +9228,44 @@ class RPAWindow(QMainWindow):
             timeout_mode = "超时急停" if cfg.get("timeout_stop", False) else "超时按失败处理"
             self.append_log(f"<hr><b><font color='blue'>>>> 引擎启动 ({start_key}启动 / {stop_key}停止) - 方案: {self.current_profile_name} - 日志: {self.log_level_combo.currentText()} - 循环: {self.loop_combo.currentText()} - {loop_range_info} - 起始步: {start_step} - 多目标: {multi_info} - {timeout_mode}</font></b>")
             
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-        if self.mini_chk.isChecked(): self.showMinimized()
+        run_id = self.engine.reserve_run()
+        if run_id is None:
+            return
 
-        if cfg.get("run_status_tip", True):
-            self.show_running_status_overlay(cfg.get("run_status_pos", "右上角"))
-        else:
+        try:
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            if self.mini_chk.isChecked(): self.showMinimized()
+
+            if cfg.get("run_status_tip", True):
+                self.show_running_status_overlay(cfg.get("run_status_pos", "右上角"))
+            else:
+                self.hide_running_status_overlay()
+            
+            self.worker = WorkerThread(self.engine, tasks, run_id)
+            self.worker.log_signal.connect(self.append_log)
+            self.worker.status_signal.connect(self.update_running_status_overlay)
+            self.worker.click_signal.connect(self.show_click_indicator_overlay)
+            self.worker.finished.connect(self.on_finish)
+            self.worker.start()
+        except Exception as e:
+            self.engine.finish_run(run_id)
+            self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             self.hide_running_status_overlay()
-        
-        self.worker = WorkerThread(self.engine, tasks)
-        self.worker.log_signal.connect(self.append_log)
-        self.worker.status_signal.connect(self.update_running_status_overlay)
-        self.worker.click_signal.connect(self.show_click_indicator_overlay)
-        self.worker.finished_signal.connect(self.on_finish)
-        self.worker.start()
+            QMessageBox.critical(self, "启动失败", str(e))
 
     def stop_task(self):
         self.engine.stop()
+        self.stop_btn.setEnabled(False)
         
     def on_finish(self):
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.hide_running_status_overlay()
+        if self._close_after_worker:
+            QTimer.singleShot(0, self.close)
+            return
         self.showNormal()
         self.activateWindow()
         if GLOBAL_CONFIG["log_to_ui"]:
