@@ -49,6 +49,7 @@ def release_readme_text() -> str:
 
 发布物料
 --------
+- LICENSE：项目 MIT 许可证与上游/本项目版权声明
 - BUILD_INFO.json：源码指纹、依赖和构建环境
 - SBOM.cdx.json：CycloneDX 软件物料清单
 - THIRD_PARTY_NOTICES.txt / THIRD_PARTY_LICENSES.txt：第三方声明与许可证

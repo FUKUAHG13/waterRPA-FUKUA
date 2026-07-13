@@ -40,6 +40,16 @@ __pypackages__/
 *.exp
 *.pdb
 
+# Local planning, experiments, and maintainer working notes
+/.scratch/
+/docs/adr/
+/docs/agents/
+/docs/GIT_GUIDE_ZH.md
+/docs/PERFORMANCE_MULTISCALE_PLAN.md
+/docs/RECOGNITION_WAKE_PLAN.md
+/docs/RUNTIME_SIZE_AUDIT.md
+/docs/UI_MODERNIZATION.md
+
 # fukuaRPA data that belongs to the current computer or user
 /.fukuaRPA_session.json
 /config.ini

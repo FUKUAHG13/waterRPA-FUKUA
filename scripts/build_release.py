@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +36,15 @@ def write_checksums(paths, output):
     run([*command, "--check"])
 
 
+def copy_project_license(release_dir: Path) -> Path:
+    source = ROOT / "LICENSE"
+    if not source.is_file():
+        raise RuntimeError(f"Project license not found: {source}")
+    destination = release_dir / "LICENSE"
+    shutil.copy2(source, destination)
+    return destination
+
+
 def build_onedir(skip_quality=False):
     run(
         [
@@ -47,6 +57,7 @@ def build_onedir(skip_quality=False):
         ]
     )
     release_dir = ROOT / "dist" / BUILD_NAME
+    copy_project_license(release_dir)
     closure_path = release_dir / "RUNTIME_CLOSURE.json"
     run(
         [

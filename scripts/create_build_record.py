@@ -36,13 +36,14 @@ SOURCE_ROOTS = (
     Path("assets/fukuaRPA.svg"),
     Path("scripts"),
     Path("tests"),
-    Path("docs"),
+    Path("docs/BUILD_FROM_SOURCE.md"),
     Path("README.md"),
     Path("ARCHITECTURE.md"),
     Path("ROADMAP.md"),
     Path("CHANGELOG.md"),
     Path("CONTEXT.md"),
     Path("AGENTS.md"),
+    Path("LICENSE"),
 )
 
 DEPENDENCIES = (

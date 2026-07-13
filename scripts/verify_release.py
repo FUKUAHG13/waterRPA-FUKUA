@@ -251,6 +251,7 @@ def verify_dist(dist_dir: Path):
     if not build_info.get("source_sha256"):
         raise RuntimeError("Build record has no source fingerprint")
     required_materials = [
+        dist_dir / "LICENSE",
         dist_dir / "SBOM.cdx.json",
         dist_dir / "THIRD_PARTY_NOTICES.txt",
         dist_dir / "THIRD_PARTY_LICENSES.txt",

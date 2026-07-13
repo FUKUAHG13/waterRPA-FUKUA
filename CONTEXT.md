@@ -1,11 +1,12 @@
 # fukuaRPA 领域上下文
 
-## 仓库与发布边界
+## 项目定位
 
-- 公开仓库为 `https://github.com/FUKUAHG13/waterRPA-fukuaRPA`。
-- `main` 可以公开仍在真实场景测试的模块化 fukuaRPA 源码，方便熟悉 Python 的用户提前查看和自行构建；这不自动等同于正式二进制发布。
-- GitHub Releases 保存经过明确发布流程验证的安装包。重构前 waterRPA 的最终源码位于 `waterRPA/`，对应历史标签继续固定在其归档提交。
-- 日常开发分支不得因为公开 `main` 而自动获得上游；新改动必须在测试完成并得到明确发布指令后再同步。
+- fukuaRPA 是面向非程序员的 Windows 桌面自动化工具，核心交互由图形界面、步骤列表、坐标操作和图片识别组成。
+- 当前主线源码位于 `fukua_rpa/`，支持从同一套业务源码构建 onedir 与 onefile。其他开发者可以在明确记录功能和依赖边界的前提下探索轻量版、旧系统版或其他变体。
+- GitHub Releases 保存已经走完发布验证的二进制包；`main` 也可公开仍在真实场景测试、可供自行构建的源码。
+- 重构前 waterRPA 的最终源码快照位于 `waterRPA/`，用于历史查阅与复现。
+- 当前主线启动时不联网；作者主页和项目链接只在用户主动点击后交给系统浏览器打开。
 
 ## 核心术语
 
@@ -55,9 +56,9 @@ WindowMappingBackend -> WindowInspector / UIAutomationBackend / PostMessage
 ReleaseBuilder -> RuntimeClosure / BuildRecord / SBOM / PayloadHashes / ExternalManifest -> PortableArchive / SHA256SUMS
 ```
 
-## 兼容承诺
+## 当前兼容行为
 
-- 只发布 Windows 10 1809+ x64 和 Windows 11 x64 完整版；同时维护多文件版和单文件版，精简版停更。
-- 同一产品主版本内继续读取并向前迁移旧方案；跨主版本不承诺无限兼容，结构性破坏必须通过大版本边界发布。
-- 不受支持的方案明确拒绝并进入只读保护，不能半加载或覆盖原配置；当前 v1 仍读取已有 `waterRPA` 配置、全量包和剪贴板键。
-- 原生 DLL 始终是可选加速层，Python/OpenCV 回退不可删除。
+- 当前主线构建目标为 Windows 10 1809+ x64 与 Windows 11 x64；其他系统需要独立依赖选择、构建目标和验证矩阵。
+- 同一产品主版本内继续读取并向前迁移旧方案；结构性破坏通过明确的大版本或转换工具处理。
+- 不受支持的方案会进入只读保护，不能半加载或覆盖原配置；当前 v1 仍读取已有 `waterRPA` 配置、全量包和剪贴板键。
+- 当前主线的原生 DLL 是可选加速层，加载、能力或运行检查失败时使用 Python/OpenCV 回退。

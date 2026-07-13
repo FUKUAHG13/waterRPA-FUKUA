@@ -1,39 +1,41 @@
-## Agent skills
+# Repository guidance
 
-### Issue tracker
+This file gives human and automated contributors a compact map of the repository. It describes the current mainline implementation, not a restriction on what a fork or future variant may explore.
 
-本项目使用 `.scratch/` 下的本地 Markdown 文件管理需求、规格和任务。详见 `docs/agents/issue-tracker.md`。
+## Read first
 
-### Domain docs
+- `README.md` explains the product and public entry points.
+- `ARCHITECTURE.md` records module boundaries, runtime invariants, and release checks.
+- `CONTEXT.md` defines the domain vocabulary used by code and tests.
+- `ROADMAP.md` lists possible future directions; roadmap entries are not release commitments.
 
-本项目采用单一上下文结构：根目录使用 `CONTEXT.md`，架构决策存放在 `docs/adr/`。详见 `docs/agents/domain.md`。
+## Change discipline
 
-### Packaging boundary
+- Prefer the existing module boundaries under `fukua_rpa/`; do not move business logic back into the entry point or UI widgets.
+- Keep edits scoped to the requested behavior. Preserve unrelated local changes and user data.
+- Never commit `config.ini`, credentials, imported user images, logs, crash reports, build output, or other machine-local state.
+- Preserve privacy boundaries: ordinary and secret text must not enter logs, diagnostics, traces, or exported profiles.
+- Keep optional native acceleration behind capability checks and a working Python/OpenCV fallback unless a separately documented variant intentionally chooses another contract.
+- Product variants such as lightweight, legacy, or experimental builds are welcome as explicit proposals. Isolate their dependency and packaging differences instead of silently changing the behavior of the current mainline edition.
 
-- 业务源码只维护完整版；精简版已经终止，不得恢复独立精简源码分支。
-- 完整版的多文件版与单文件版来自同一套源码，只允许打包规格不同。
-- 用户未明确要求“打包”时，不得创建、更新或覆盖 `dist/` 发布目录、ZIP、发布清单或校验文件。
-- 用户仅说“打包”而没有明确要求单文件版时，只构建完整版多文件版（`--format onedir`）。
-- 只有用户明确写出“单文件版”或明确要求两种格式时，才构建 onefile；不得把单文件版隐含加入默认构建。
-- onedir 与 onefile 必须共同调用 `scripts/runtime_pruning.py`，不得在两份 spec 中复制或分叉删减名单。
-- 已验证删减项不得重新进入发布载荷；`qwindows.dll`、`qoffscreen.dll`、`qjpeg.dll` 和 `opengl32sw.dll` 属于明确保留的兼容载荷。
+## Verification
 
-### Profile compatibility boundary
+- During development, run focused tests for the changed behavior and nearby contracts.
+- Before publishing a binary release, run the complete release verification, including unit tests, Ruff, native rebuild, performance gates, soak tests, frozen startup checks, runtime-closure audit, and archive verification.
+- Add or update tests when changing configuration defaults, persistence, migration, execution parameters, workflow behavior, packaging, or security boundaries.
 
-- 同一产品主版本内必须继续读取并向前迁移旧方案；新增普通字段优先通过默认值兼容，不为每个小版本建立独立源码或方案分支。
-- 允许破坏方案结构的变更只能进入明确的大版本。提高最低方案版本前必须保留旧文件，并提供清晰拒绝提示或单独转换路径。
-- 不受支持的过旧或过新方案只能只读拒绝；不得半加载、静默降级、自动保存或覆盖原配置与自动备份。
-- 当前主版本只承诺本主版本的方案兼容；跨主版本兼容属于明确评估项，不无限累积历史格式。
+## Packaging
 
-### Verification scope
+- The current onedir and onefile packages share the same `fukua_rpa` business source and differ only in PyInstaller packaging.
+- `python scripts/build_release.py` builds the current default onedir package.
+- `python scripts/build_release.py --format onefile` builds the onefile package.
+- `python scripts/build_release.py --format all` builds both formats.
+- Both existing formats must use `scripts/runtime_pruning.py` and retain the verified Qt platform, JPEG, software OpenGL, native-core, and UI Automation runtime payloads they require.
+- A new package variant should document its feature boundary, dependency boundary, target systems, and test matrix rather than copying the main application into an untracked second codebase.
 
-- 用户没有明确要求打包时，不运行完整测试集、`verify_release.py`、全套性能基准、耐久测试或发行态烟雾；日常修改只运行与改动功能直接相关以及可能受影响的定向测试。
-- 只有用户明确要求打包，或明确要求完整发布前验证时，才执行数百项完整测试、原生重编译、性能/耐久门和冻结产物烟雾。
-- 定向测试必须覆盖新增配置的默认值、保存/读取、运行参数传递和核心行为；不能以“避免全量测试”为由完全跳过验证。
+## Compatibility and safety
 
-### Runtime performance boundaries
-
-- GUI 首帧前不得主动导入完整主窗口、OpenCV、NumPy、PyAutoGUI 或 UI Automation；新增入口依赖必须通过启动架构与冻结 EXE 启动烟雾。
-- 缩放自动学习只保存在当前进程内；不得未经单独设计把历史写入方案、备份或全量包。
-- 优先倍率只改变“快速一个”的搜索顺序；所有优先项未命中后必须完整回退，“全部匹配”始终搜索全部倍率。
-- 画面变化唤醒只缩短自适应额外等待。DXGI 只能作为变化通知并须由分块指纹确认；常用倍率专搜未命中后必须紧接完整范围搜索。
+- Profile migrations must preserve the original file or backup before conversion. Unsupported profiles must not be partially loaded and then overwritten.
+- Background actions must not silently fall back to moving or clicking the real mouse when their result is unknown.
+- External threads, hooks, and native jobs must have bounded work and repeatable shutdown behavior.
+- Startup must remain offline. User-triggered links may open the system browser, but the application must not add hidden telemetry or automatic network checks.

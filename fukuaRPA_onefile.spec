@@ -18,7 +18,7 @@ a = Analysis(
     ["fukuaRPA.py"],
     pathex=[],
     binaries=[("fukua_rpa_core.dll", "."), *uia_binaries],
-    datas=[("assets/fukuaRPA.ico", "assets")],
+    datas=[("assets/fukuaRPA.ico", "assets"), ("LICENSE", ".")],
     hiddenimports=["fukua_rpa.native_smoke", "pyautogui"],
     hookspath=[],
     hooksconfig={},

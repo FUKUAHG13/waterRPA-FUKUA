@@ -222,6 +222,7 @@ def build_sbom(app_version: str, build_name: str) -> tuple[dict, dict[str, dict]
                 "bom-ref": f"fukuaRPA:{app_version}",
                 "name": "fukuaRPA",
                 "version": app_version.lstrip("v"),
+                "licenses": [{"license": {"id": "MIT"}}],
             },
             "properties": [
                 {"name": "fukuaRPA.build_name", "value": build_name},

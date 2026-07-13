@@ -15,6 +15,7 @@ from fukua_rpa.constants import (
     PROJECT_RELEASES_URL,
 )
 from scripts.audit_runtime_closure import build_runtime_closure
+from scripts.build_release import copy_project_license
 from scripts.create_build_record import source_fingerprint
 from scripts.create_release_archive import build_archive, verify_archive
 from scripts.create_release_checksums import build_checksums, verify_checksums
@@ -41,10 +42,12 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("fukuaRPA_onefile.spec", paths)
         self.assertIn("assets/version_info_onefile.txt", paths)
         self.assertIn("tests/test_release_tooling.py", paths)
-        self.assertIn("docs/adr/0015-native-abi-and-frozen-parity.md", paths)
-        self.assertIn("docs/adr/0017-bounded-native-multiscale-scheduler.md", paths)
+        self.assertIn("docs/BUILD_FROM_SOURCE.md", paths)
         self.assertIn("AGENTS.md", paths)
+        self.assertIn("LICENSE", paths)
         self.assertIn("assets/fukuaRPA.svg", paths)
+        self.assertFalse(any(path.startswith(".scratch/") for path in paths))
+        self.assertFalse(any(path.startswith("docs/adr/") for path in paths))
 
     def test_version_identity_is_consistent_in_spec_and_windows_resource(self):
         spec = (ROOT / "fukuaRPA_onedir.spec").read_text(encoding="utf-8")
@@ -71,6 +74,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("name=ONEFILE_BUILD_NAME", onefile_spec)
         self.assertIn('"pyautogui"', onefile_spec)
         self.assertIn("apply_runtime_pruning(a)", onefile_spec)
+        self.assertIn('(\"LICENSE\", \".\")', onefile_spec)
         self.assertNotIn("COLLECT(", onefile_spec)
         self.assertIn(f"{APP_VERSION.removeprefix('v')}.0", version_info)
         self.assertIn(f"{BUILD_NAME}.exe", version_info)
@@ -89,8 +93,16 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("build_onedir", script)
         self.assertIn("build_onefile", script)
         self.assertNotIn("lite.spec", script)
-        guard = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
-        self.assertIn("没有明确要求单文件版时，只构建完整版多文件版", guard)
+
+    def test_project_license_preserves_upstream_notice_and_is_copyable(self):
+        license_text = (ROOT / "LICENSE").read_text(encoding="utf-8")
+        self.assertIn("MIT License", license_text)
+        self.assertIn("Copyright (c) 2026 unfiled0", license_text)
+        self.assertIn("Copyright (c) 2026 FUKUAHG13", license_text)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            release_dir = Path(temp_dir)
+            copied = copy_project_license(release_dir)
+            self.assertEqual(copied.read_text(encoding="utf-8"), license_text)
 
     def test_native_build_enforces_static_runtime_and_x64_pe(self):
         build_script = (ROOT / "native_core" / "build_native_core.ps1").read_text(
@@ -119,6 +131,10 @@ class ReleaseToolingTests(unittest.TestCase):
     def test_sbom_contains_new_runtime_and_build_scopes(self):
         sbom, components = build_sbom(APP_VERSION, BUILD_NAME)
         self.assertEqual(sbom["bomFormat"], "CycloneDX")
+        self.assertEqual(
+            sbom["metadata"]["component"]["licenses"],
+            [{"license": {"id": "MIT"}}],
+        )
         self.assertIn("uiautomation", components)
         self.assertIn("comtypes", components)
         self.assertEqual(components["uiautomation"]["scope"], "runtime")
@@ -261,6 +277,7 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn("完整解压", text)
         self.assertIn("启动时不联网", text)
         self.assertIn("不能单独证明发布者身份", text)
+        self.assertIn("LICENSE", text)
 
     def test_runtime_closure_accepts_x64_static_native_core(self):
         with tempfile.TemporaryDirectory() as temp_dir:

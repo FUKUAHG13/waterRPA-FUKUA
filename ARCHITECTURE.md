@@ -29,7 +29,7 @@ scripts/
   build_icon.py                # 从 SVG 重建 PNG/ICO
   build_release.py             # 原生核心、双格式冻结包与质量门的一键发布
   runtime_pruning.py           # onedir/onefile 共用的已验证可选运行载荷过滤与回归检查
-  create_build_record.py       # 运行源码、测试、ADR、资产、依赖与构建环境指纹
+  create_build_record.py       # 运行源码、测试、公开文档、资产、依赖与构建环境指纹
   create_sbom.py               # CycloneDX SBOM、第三方声明和许可证汇总
   create_release_info.py       # 发布哈希与真实 Authenticode 状态
   create_release_readme.py     # 最终用户解压、离线与未签名边界说明
@@ -177,11 +177,11 @@ tests/
     完全一致、MSVC C++17、Windows 10 目标且 `/MT` 的 DLL，并检查 PE 导入表不存在动态 VC/UCRT。
 33. 发布目录中所有 EXE/DLL/PYD 必须通过 AMD64 与依赖闭包审计；直接导入的 MSVC 运行库必须
     在包内找到，系统 DLL/API Set 可由 Windows 提供，无法解析或包外依赖会阻止发布。
-34. 完整多文件版和完整单文件版必须来自同一套 `fukua_rpa` 源码，不建立独立功能分支。多文件版
-    额外执行逐文件闭包、清单和 ZIP 复核；单文件版额外核对 x64 启动器、冻结资源解压、可写目录
-    仍位于 EXE 旁，以及内置原生/UIA 组件的发行态烟雾。精简版不得重新进入构建矩阵。
-35. 用户未明确要求单文件时，`scripts/build_release.py` 与维护流程都只能默认生成完整版 onedir；
-    onefile 仍使用同一源码，但必须由 `--format onefile` 或 `--format all` 显式请求。
+34. 当前完整多文件版和完整单文件版来自同一套 `fukua_rpa` 源码。多文件版额外执行逐文件闭包、
+    清单和 ZIP 复核；单文件版额外核对 x64 启动器、冻结资源解压、可写目录仍位于 EXE 旁，
+    以及内置原生/UIA 组件的发行态烟雾。新的产品变体应明确记录差异，不应暗中改变同名产物。
+35. `scripts/build_release.py` 当前默认生成 onedir，也可通过 `--format onefile` 或 `--format all`
+    构建其他现有格式；三个入口共享版本身份、业务源码和相应的发行态验证。
 36. 自动学习的缩放倍率只允许驻留当前进程内，不写入方案、备份或全量包。手动优先倍率属于用户
     配置；无论自动或手动优先项是否命中，快速一个都必须保留完整范围回退，全部匹配不得使用捷径。
 37. GUI 启动首帧前不得导入完整主窗口、OpenCV、NumPy、PyAutoGUI 或 UI Automation。工作区类
