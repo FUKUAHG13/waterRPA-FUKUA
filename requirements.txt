@@ -1,4 +1,4 @@
-# Reproducible fukuaRPA_v1.0.3 onedir build baseline: CPython 3.14.3 x64.
+# Reproducible complete build baseline: CPython 3.14.3 x64.
 # Supported OS: Windows 10 1809+ x64 and Windows 11 x64.
 pyautogui==0.9.54
 pyperclip==1.11.0

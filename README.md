@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/FUKUAHG13/waterRPA-FUKUA/releases">下载最新版</a>
+  <a href="https://github.com/FUKUAHG13/waterRPA-fukuaRPA/releases">下载最新版</a>
   ·
   <a href="https://space.bilibili.com/95794432/dynamic">作者 B 站主页</a>
 </p>
@@ -69,7 +69,7 @@
 
 ## 三步开始使用
 
-1. 前往 [Releases](https://github.com/FUKUAHG13/waterRPA-FUKUA/releases) 下载最新完整版。
+1. 前往 [Releases](https://github.com/FUKUAHG13/waterRPA-fukuaRPA/releases) 下载最新完整版。
 2. 解压多文件版并运行文件夹内的 EXE，或直接运行单文件版。
 3. 在主界面添加步骤、填写坐标或选择图片，设置启动和停止热键后开始运行。
 
@@ -87,9 +87,15 @@
 
 软件的方案、图片和运行日志默认保存在本地。程序启动时不会主动联网；设置中的作者主页与 GitHub 按钮只会在用户主动点击后打开对应网页。
 
+## 重构版源码预览
+
+`main` 分支同时公开正在真实场景测试的模块化 fukuaRPA 源码，供愿意提前体验、能够自行处理 Python 环境的用户查看和构建。它不是当前 Releases 中的正式安装包，功能和配置仍可能在测试期间调整；只想直接使用软件的用户应优先下载 Releases 中已经打包的稳定版本。
+
+源码运行、编译环境和多文件/单文件打包命令见 [从源码运行与构建](docs/BUILD_FROM_SOURCE.md)。重构前的最终源码快照保存在 [`waterRPA`](waterRPA) 目录，便于历史查阅和复现。
+
 ## 项目入口
 
-- [下载与历史版本](https://github.com/FUKUAHG13/waterRPA-FUKUA/releases)
+- [下载与历史版本](https://github.com/FUKUAHG13/waterRPA-fukuaRPA/releases)
 - [作者 B 站主页](https://space.bilibili.com/95794432/dynamic)
 
 版本变化、修复记录、构建验证和开发细节会放在对应 Release、更新日志或项目文档中，不再堆放到首页。首页只保留软件定位、核心能力和长期有效的使用入口。

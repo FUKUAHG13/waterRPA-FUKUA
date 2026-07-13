@@ -1,5 +1,12 @@
 # fukuaRPA 领域上下文
 
+## 仓库与发布边界
+
+- 公开仓库为 `https://github.com/FUKUAHG13/waterRPA-fukuaRPA`。
+- `main` 可以公开仍在真实场景测试的模块化 fukuaRPA 源码，方便熟悉 Python 的用户提前查看和自行构建；这不自动等同于正式二进制发布。
+- GitHub Releases 保存经过明确发布流程验证的安装包。重构前 waterRPA 的最终源码位于 `waterRPA/`，对应历史标签继续固定在其归档提交。
+- 日常开发分支不得因为公开 `main` 而自动获得上游；新改动必须在测试完成并得到明确发布指令后再同步。
+
 ## 核心术语
 
 - **方案（Profile）**：一组全局设置、按键映射和步骤的可保存配置。

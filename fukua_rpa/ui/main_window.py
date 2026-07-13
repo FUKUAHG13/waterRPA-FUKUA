@@ -63,6 +63,7 @@ from ..config_store import (
 from ..config_schema import default_profile_config, migrate_profile_config
 from ..constants import (
     APP_VERSION,
+    AUTHOR_BILIBILI_URL,
     BUILD_NAME,
     LEGACY_TASK_CLIPBOARD_KEY,
     MAX_CLICK_INDICATOR_OVERLAYS,
@@ -70,6 +71,7 @@ from ..constants import (
     MAX_PROFILES,
     NATIVE_CORE_DLL_NAME,
     PRODUCT_NAME,
+    PROJECT_RELEASES_URL,
     SUPPORTED_WINDOWS_TEXT,
     TASK_TYPE_SECRET_TEXT,
     TASK_CLIPBOARD_KEY,
@@ -1115,11 +1117,15 @@ class RPAWindow(QMainWindow):
         links_row.addStretch()
         bilibili_btn = QPushButton("作者B站主页")
         bilibili_btn.setProperty("variant", "ghost")
-        bilibili_btn.clicked.connect(lambda: self.open_web_url("https://space.bilibili.com/95794432/dynamic"))
+        bilibili_btn.clicked.connect(
+            lambda: self.open_web_url(AUTHOR_BILIBILI_URL)
+        )
         links_row.addWidget(bilibili_btn)
         github_btn = QPushButton("GitHub下载页")
         github_btn.setProperty("variant", "ghost")
-        github_btn.clicked.connect(lambda: self.open_web_url("https://github.com/FUKUAHG13/waterRPA-FUKUA/releases"))
+        github_btn.clicked.connect(
+            lambda: self.open_web_url(PROJECT_RELEASES_URL)
+        )
         links_row.addWidget(github_btn)
         settings_content_layout.addLayout(links_row)
         settings_content_layout.addStretch()

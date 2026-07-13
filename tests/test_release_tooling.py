@@ -8,7 +8,12 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from fukua_rpa.constants import APP_VERSION, BUILD_NAME, ONEFILE_BUILD_NAME
+from fukua_rpa.constants import (
+    APP_VERSION,
+    BUILD_NAME,
+    ONEFILE_BUILD_NAME,
+    PROJECT_RELEASES_URL,
+)
 from scripts.audit_runtime_closure import build_runtime_closure
 from scripts.create_build_record import source_fingerprint
 from scripts.create_release_archive import build_archive, verify_archive
@@ -71,6 +76,9 @@ class ReleaseToolingTests(unittest.TestCase):
         self.assertIn(f"{BUILD_NAME}.exe", version_info)
         self.assertIn(f"{ONEFILE_BUILD_NAME}.exe", onefile_version_info)
         self.assertEqual(APP_VERSION, "v1.0.12")
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(PROJECT_RELEASES_URL, readme)
+        self.assertNotIn("waterRPA-FUKUA", readme)
 
     def test_release_builder_defaults_to_complete_onedir(self):
         script = (ROOT / "scripts" / "build_release.py").read_text(
@@ -160,6 +168,7 @@ class ReleaseToolingTests(unittest.TestCase):
             self.assertEqual(report["executable"]["authenticode"]["status"], "NotSigned")
             self.assertFalse(report["network_on_startup"])
             self.assertFalse(report["automatic_update_check"])
+            self.assertEqual(report["update_url"], PROJECT_RELEASES_URL)
             self.assertEqual(
                 report["runtime_closure"]["sha256"], hash_file(runtime_closure)
             )

@@ -7,9 +7,16 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from fukua_rpa.constants import PROJECT_RELEASES_URL  # noqa: E402
 
 
 def hash_file(path: Path) -> str:
@@ -121,7 +128,7 @@ def build_release_info(release_dir: Path, build_name: str) -> dict:
         "network_on_startup": False,
         "automatic_update_check": False,
         "update_channel": "manual GitHub releases",
-        "update_url": "https://github.com/FUKUAHG13/waterRPA-FUKUA/releases",
+        "update_url": PROJECT_RELEASES_URL,
         "executable": {
             "path": executable.name,
             "size": executable.stat().st_size,
