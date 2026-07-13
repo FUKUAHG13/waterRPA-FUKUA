@@ -1,0 +1,179 @@
+{
+  "format": "fukuaRPA_native_scheduler_benchmark_v1",
+  "generated_at": "2026-07-12 16:23:53",
+  "expected_center": [
+    216.0,
+    196.0
+  ],
+  "current": {
+    "api_version": 10800,
+    "capabilities": {
+      "mask": 8191,
+      "gdi_capture": true,
+      "multi_region": true,
+      "multi_scale": true,
+      "grayscale": true,
+      "color": true,
+      "find_all": true,
+      "template_lru": true,
+      "performance_counters": true,
+      "work_budget": true,
+      "single_capture_per_region": true,
+      "abi_metadata": true,
+      "bounded_job_pool": true,
+      "preferred_scale_fallback": true
+    },
+    "scenarios": {
+      "auto_full": {
+        "rounds": 50,
+        "p50_ms": 16.876,
+        "p95_ms": 18.425,
+        "mean_ms": 16.687,
+        "cpu_ms_total": 4093.75,
+        "cpu_to_wall_percent": 490.6,
+        "rss_bytes": 57323520,
+        "match": [
+          216.0,
+          196.0,
+          1.0,
+          1.0
+        ],
+        "native_stats": {
+          "calls": 50,
+          "captures": 50,
+          "integral_builds": 50,
+          "template_cache_hits": 50,
+          "template_cache_misses": 0,
+          "template_variants_built": 0,
+          "work_budget_fallbacks": 0,
+          "capture_ms": 283.671,
+          "template_ms": 0.0,
+          "match_ms": 542.367,
+          "cache_bytes": 21092,
+          "cache_entries": 1
+        },
+        "distance_to_expected": 0.0
+      },
+      "single_thread_full": {
+        "rounds": 50,
+        "p50_ms": 83.358,
+        "p95_ms": 85.867,
+        "mean_ms": 84.016,
+        "cpu_ms_total": 3359.375,
+        "cpu_to_wall_percent": 80.0,
+        "rss_bytes": 57352192,
+        "match": [
+          216.0,
+          196.0,
+          1.0,
+          1.0
+        ],
+        "native_stats": {
+          "calls": 50,
+          "captures": 50,
+          "integral_builds": 50,
+          "template_cache_hits": 50,
+          "template_cache_misses": 0,
+          "template_variants_built": 0,
+          "work_budget_fallbacks": 0,
+          "capture_ms": 809.991,
+          "template_ms": 0.0,
+          "match_ms": 3381.721,
+          "cache_bytes": 21092,
+          "cache_entries": 1
+        },
+        "distance_to_expected": 0.0
+      },
+      "forced_multi_full": {
+        "rounds": 50,
+        "p50_ms": 16.577,
+        "p95_ms": 18.547,
+        "mean_ms": 16.883,
+        "cpu_ms_total": 3250.0,
+        "cpu_to_wall_percent": 385.0,
+        "rss_bytes": 57479168,
+        "match": [
+          216.0,
+          196.0,
+          1.0,
+          1.0
+        ],
+        "native_stats": {
+          "calls": 50,
+          "captures": 50,
+          "integral_builds": 50,
+          "template_cache_hits": 50,
+          "template_cache_misses": 0,
+          "template_variants_built": 0,
+          "work_budget_fallbacks": 0,
+          "capture_ms": 294.475,
+          "template_ms": 0.0,
+          "match_ms": 541.636,
+          "cache_bytes": 21092,
+          "cache_entries": 1
+        },
+        "distance_to_expected": 0.0
+      },
+      "preferred_hit": {
+        "rounds": 50,
+        "p50_ms": 16.677,
+        "p95_ms": 17.436,
+        "mean_ms": 16.674,
+        "cpu_ms_total": 312.5,
+        "cpu_to_wall_percent": 37.5,
+        "rss_bytes": 57479168,
+        "match": [
+          216.0,
+          196.0,
+          1.0,
+          1.0
+        ],
+        "native_stats": {
+          "calls": 50,
+          "captures": 50,
+          "integral_builds": 50,
+          "template_cache_hits": 50,
+          "template_cache_misses": 0,
+          "template_variants_built": 0,
+          "work_budget_fallbacks": 0,
+          "capture_ms": 705.331,
+          "template_ms": 0.0,
+          "match_ms": 120.912,
+          "cache_bytes": 21092,
+          "cache_entries": 1
+        },
+        "distance_to_expected": 0.0
+      },
+      "preferred_miss_fallback": {
+        "rounds": 50,
+        "p50_ms": 16.587,
+        "p95_ms": 18.836,
+        "mean_ms": 16.631,
+        "cpu_ms_total": 3171.875,
+        "cpu_to_wall_percent": 381.4,
+        "rss_bytes": 57552896,
+        "match": [
+          216.0,
+          196.0,
+          1.0,
+          1.0
+        ],
+        "native_stats": {
+          "calls": 50,
+          "captures": 50,
+          "integral_builds": 50,
+          "template_cache_hits": 50,
+          "template_cache_misses": 0,
+          "template_variants_built": 0,
+          "work_budget_fallbacks": 0,
+          "capture_ms": 279.148,
+          "template_ms": 0.0,
+          "match_ms": 545.514,
+          "cache_bytes": 21092,
+          "cache_entries": 1
+        },
+        "distance_to_expected": 0.0
+      }
+    }
+  }
+}

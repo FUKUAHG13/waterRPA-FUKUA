@@ -1,0 +1,65 @@
+{
+  "format": "fukuaRPA_runtime_diagnostics",
+  "generated_at": "2026-07-11 20:25:28",
+  "supported_windows": "Windows 10 1809 及以上版本（仅 x64）和 Windows 11",
+  "base_dir": "D:\\Desktop\\waterRPA\\fukuaRPA",
+  "frozen": false,
+  "ok": true,
+  "checks": [
+    {
+      "name": "architecture",
+      "ok": true,
+      "detail": "64-bit AMD64"
+    },
+    {
+      "name": "windows_version",
+      "ok": true,
+      "detail": "Windows 10.0 build 26200"
+    },
+    {
+      "name": "import:PySide6",
+      "ok": true,
+      "detail": "6.11.0"
+    },
+    {
+      "name": "import:cv2",
+      "ok": true,
+      "detail": "4.13.0"
+    },
+    {
+      "name": "import:numpy",
+      "ok": true,
+      "detail": "2.4.4"
+    },
+    {
+      "name": "import:PIL",
+      "ok": true,
+      "detail": "12.2.0"
+    },
+    {
+      "name": "import:pyautogui",
+      "ok": true,
+      "detail": "0.9.54"
+    },
+    {
+      "name": "import:mss",
+      "ok": true,
+      "detail": "10.2.0"
+    },
+    {
+      "name": "native_dll_file",
+      "ok": true,
+      "detail": "D:\\Desktop\\waterRPA\\fukuaRPA\\fukua_rpa_core.dll"
+    },
+    {
+      "name": "native_dll_api",
+      "ok": true,
+      "detail": "version=10400"
+    },
+    {
+      "name": "runtime_directory_writable",
+      "ok": true,
+      "detail": "D:\\Desktop\\waterRPA\\fukuaRPA"
+    }
+  ]
+}
