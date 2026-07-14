@@ -42,6 +42,7 @@ __pypackages__/
 
 # Local planning, experiments, and maintainer working notes
 /.scratch/
+/CHANGELOG.md
 /docs/adr/
 /docs/agents/
 /docs/GIT_GUIDE_ZH.md

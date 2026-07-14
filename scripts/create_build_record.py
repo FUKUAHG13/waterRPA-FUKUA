@@ -40,7 +40,6 @@ SOURCE_ROOTS = (
     Path("README.md"),
     Path("ARCHITECTURE.md"),
     Path("ROADMAP.md"),
-    Path("CHANGELOG.md"),
     Path("CONTEXT.md"),
     Path("AGENTS.md"),
     Path("LICENSE"),
